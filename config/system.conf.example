@@ -1,0 +1,68 @@
+# rclone-mount-manager system/global configuration.
+#
+# Default install path:
+#   /etc/rclone-mount-manager/config
+#
+# This is a Bash config file. Keep it local and trusted.
+
+MODE=system
+
+# Base directory for globally shared mounts.
+ROOT_DIR_PATH="/mnt/rclone"
+
+# Logs and runtime state.
+LOG_DIR="/var/log/rclone-mount-manager"
+STATE_DIR="/run/rclone-mount-manager"
+
+# System services normally need an explicit rclone config path.
+# Uncomment and adjust if your system service cannot see the intended remotes.
+# export RCLONE_CONFIG="/etc/rclone/rclone.conf"
+
+# Mount/unmount wait windows.
+START_TIMEOUT_SECONDS=20
+STOP_TIMEOUT_SECONDS=20
+
+# Pre-mount remote availability check.
+CONNECTIVITY_CHECK=remote
+CONNECTIVITY_RETRIES=12
+CONNECTIVITY_INTERVAL_SECONDS=5
+CONNECTIVITY_TIMEOUT_SECONDS=15
+
+# Safety defaults.
+REQUIRE_EMPTY_MOUNTPOINT=true
+ROLLBACK_ON_START_FAILURE=true
+
+# Default options applied to every mount.
+#
+# For mounts shared by all users, add --allow-other only after enabling
+# user_allow_other in /etc/fuse.conf.
+DEFAULT_OPTIONS=(
+  --vfs-cache-mode full
+  --vfs-cache-max-size 10G
+  --vfs-cache-max-age 12h
+  --dir-cache-time 72h
+  --poll-interval 30s
+  --attr-timeout 1s
+  --transfers 4
+  --multi-thread-streams 4
+  # --allow-other
+)
+
+# Add shared mounts here.
+MOUNTS=(
+  # SharedDrive
+)
+
+REMOTES=(
+  # [SharedDrive]="SharedDrive:"
+)
+
+# Optional absolute mount point overrides.
+MOUNT_POINTS=(
+  # [SharedDrive]="/srv/shared/cloud"
+)
+
+# Optional per-mount rclone options.
+MOUNT_OPTIONS=(
+  # [SharedDrive]="--vfs-read-chunk-size 256M"
+)

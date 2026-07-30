@@ -1,0 +1,64 @@
+# rclone-mount-manager user configuration.
+#
+# Default install path:
+#   ~/.config/rclone-mount-manager/config
+#
+# This is a Bash config file. Keep it local and trusted.
+
+MODE=user
+
+# Base directory for mounts without an explicit MOUNT_POINTS override.
+ROOT_DIR_PATH="$HOME/mnt/rclone"
+
+# Logs and runtime state.
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/rclone-mount-manager/logs"
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+  STATE_DIR="$XDG_RUNTIME_DIR/rclone-mount-manager"
+else
+  STATE_DIR="/tmp/rclone-mount-manager-$(id -u)"
+fi
+
+# Mount/unmount wait windows.
+START_TIMEOUT_SECONDS=20
+STOP_TIMEOUT_SECONDS=20
+
+# Pre-mount remote availability check.
+CONNECTIVITY_CHECK=remote
+CONNECTIVITY_RETRIES=12
+CONNECTIVITY_INTERVAL_SECONDS=5
+CONNECTIVITY_TIMEOUT_SECONDS=15
+
+# Safety defaults.
+REQUIRE_EMPTY_MOUNTPOINT=true
+ROLLBACK_ON_START_FAILURE=true
+
+# Default options applied to every mount.
+DEFAULT_OPTIONS=(
+  --vfs-cache-mode full
+  --vfs-cache-max-size 10G
+  --vfs-cache-max-age 12h
+  --dir-cache-time 72h
+  --poll-interval 30s
+  --attr-timeout 1s
+  --transfers 4
+  --multi-thread-streams 4
+)
+
+# Add your mounts here.
+MOUNTS=(
+  # PersonalDrive
+)
+
+REMOTES=(
+  # [PersonalDrive]="PersonalDrive:"
+)
+
+# Optional absolute mount point overrides.
+MOUNT_POINTS=(
+  # [PersonalDrive]="$HOME/Documents/Cloud"
+)
+
+# Optional per-mount rclone options.
+MOUNT_OPTIONS=(
+  # [PersonalDrive]="--vfs-read-chunk-size 128M"
+)

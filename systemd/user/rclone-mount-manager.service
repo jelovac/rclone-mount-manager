@@ -1,0 +1,16 @@
+[Unit]
+Description=rclone mount manager user mounts
+Documentation=man:rclone(1)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=RMM_CONFIG_FILE=@CONFIG_FILE@
+ExecStart=@BIN_PATH@ run
+ExecStop=@BIN_PATH@ stop
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target

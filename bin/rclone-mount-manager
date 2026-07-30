@@ -1,0 +1,722 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="rclone-mount-manager"
+VERSION="0.1.0"
+
+USER_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME/config"
+SYSTEM_CONFIG_FILE="/etc/$APP_NAME/config"
+
+CONFIG_FILE="${RMM_CONFIG_FILE:-}"
+MODE="${RMM_MODE:-user}"
+ROOT_DIR_PATH="${RMM_ROOT_DIR_PATH:-}"
+LOG_DIR="${RMM_LOG_DIR:-}"
+STATE_DIR="${RMM_STATE_DIR:-}"
+START_TIMEOUT_SECONDS="${RMM_START_TIMEOUT_SECONDS:-20}"
+STOP_TIMEOUT_SECONDS="${RMM_STOP_TIMEOUT_SECONDS:-20}"
+CONNECTIVITY_CHECK="${RMM_CONNECTIVITY_CHECK:-remote}"
+CONNECTIVITY_RETRIES="${RMM_CONNECTIVITY_RETRIES:-12}"
+CONNECTIVITY_INTERVAL_SECONDS="${RMM_CONNECTIVITY_INTERVAL_SECONDS:-5}"
+CONNECTIVITY_TIMEOUT_SECONDS="${RMM_CONNECTIVITY_TIMEOUT_SECONDS:-15}"
+REQUIRE_EMPTY_MOUNTPOINT="${RMM_REQUIRE_EMPTY_MOUNTPOINT:-true}"
+ROLLBACK_ON_START_FAILURE="${RMM_ROLLBACK_ON_START_FAILURE:-true}"
+
+DEFAULT_OPTIONS=(
+  --vfs-cache-mode full
+  --vfs-cache-max-size 10G
+  --vfs-cache-max-age 12h
+  --dir-cache-time 72h
+  --poll-interval 30s
+  --attr-timeout 1s
+  --transfers 4
+  --multi-thread-streams 4
+)
+
+MOUNTS=()
+STARTED_MOUNTS=()
+declare -A REMOTES=()
+declare -A MOUNT_POINTS=()
+declare -A MOUNT_OPTIONS=()
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+$APP_NAME $VERSION
+
+Usage:
+  $APP_NAME <command>
+
+Commands:
+  start          Mount configured remotes using rclone --daemon.
+  stop           Gracefully unmount configured remotes.
+  restart        Stop and start configured remotes.
+  status         Show configured mount status.
+  run            Foreground supervised mode for systemd.
+  doctor         Check dependencies, config, remotes, and mount paths.
+  print-config   Print resolved runtime settings.
+  help           Show this help.
+
+Configuration:
+  User default:   $USER_CONFIG_FILE
+  System default: $SYSTEM_CONFIG_FILE
+  Override:       RMM_CONFIG_FILE=/path/to/config
+EOF
+}
+
+is_true() {
+  case "${1,,}" in
+    1|yes|true|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_absolute_path() {
+  local path="$1"
+  local dir
+  local base
+
+  if [[ "$path" == /* ]]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+
+  dir="$(cd -- "$(dirname -- "$path")" >/dev/null 2>&1 && pwd -P)" || return 1
+  base="$(basename -- "$path")"
+  printf '%s/%s\n' "$dir" "$base"
+}
+
+select_config_file() {
+  if [[ -n "$CONFIG_FILE" ]]; then
+    CONFIG_FILE="$(resolve_absolute_path "$CONFIG_FILE")" || die "Cannot resolve config file path: $CONFIG_FILE"
+    [[ -f "$CONFIG_FILE" ]] || die "Config file does not exist: $CONFIG_FILE"
+    return 0
+  fi
+
+  if [[ -f "$USER_CONFIG_FILE" ]]; then
+    CONFIG_FILE="$USER_CONFIG_FILE"
+    return 0
+  fi
+
+  if [[ "$(id -u)" == "0" && -f "$SYSTEM_CONFIG_FILE" ]]; then
+    CONFIG_FILE="$SYSTEM_CONFIG_FILE"
+    return 0
+  fi
+}
+
+apply_runtime_defaults() {
+  case "$MODE" in
+    user|system) ;;
+    *) die "MODE must be either 'user' or 'system'; got '$MODE'" ;;
+  esac
+
+  if [[ -z "$ROOT_DIR_PATH" ]]; then
+    if [[ "$MODE" == "system" ]]; then
+      ROOT_DIR_PATH="/mnt/rclone"
+    else
+      ROOT_DIR_PATH="$HOME/mnt/rclone"
+    fi
+  fi
+
+  if [[ -z "$LOG_DIR" ]]; then
+    if [[ "$MODE" == "system" ]]; then
+      LOG_DIR="/var/log/$APP_NAME"
+    else
+      LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$APP_NAME/logs"
+    fi
+  fi
+
+  if [[ -z "$STATE_DIR" ]]; then
+    if [[ "$MODE" == "system" ]]; then
+      STATE_DIR="/run/$APP_NAME"
+    elif [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+      STATE_DIR="$XDG_RUNTIME_DIR/$APP_NAME"
+    else
+      STATE_DIR="/tmp/$APP_NAME-$(id -u)"
+    fi
+  fi
+}
+
+load_config() {
+  select_config_file || true
+
+  if [[ -n "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+  fi
+
+  apply_runtime_defaults
+}
+
+validate_config() {
+  local mount_name
+
+  ((${#MOUNTS[@]} > 0)) || die "No mounts configured. Create/edit a config file first."
+
+  for mount_name in "${MOUNTS[@]}"; do
+    [[ -n "$mount_name" ]] || die "Mount names must not be empty."
+    [[ -n "${REMOTES[$mount_name]:-}" ]] || die "Missing REMOTES[$mount_name]."
+  done
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is not installed or not found in PATH."
+}
+
+ensure_requirements_for_start() {
+  require_command rclone
+  require_command mountpoint
+  if [[ "$CONNECTIVITY_CHECK" == "remote" ]]; then
+    require_command timeout
+  fi
+}
+
+ensure_directories() {
+  mkdir -p "$ROOT_DIR_PATH" "$LOG_DIR"
+  ensure_state_directory
+}
+
+ensure_state_directory() {
+  local current_uid
+  local state_owner
+  local state_mode
+
+  current_uid="$(id -u)"
+
+  if [[ -e "$STATE_DIR" && ! -d "$STATE_DIR" ]]; then
+    die "State path exists but is not a directory: $STATE_DIR"
+  fi
+
+  mkdir -p -m 0700 "$STATE_DIR"
+
+  state_owner="$(stat -c '%u' "$STATE_DIR")"
+  state_mode="$(stat -c '%a' "$STATE_DIR")"
+
+  [[ "$state_owner" == "$current_uid" ]] || die "State dir is not owned by current user: $STATE_DIR"
+
+  if (( 8#$state_mode & 8#077 )); then
+    chmod 0700 "$STATE_DIR"
+  fi
+}
+
+mount_point_for() {
+  local mount_name="$1"
+  printf '%s\n' "${MOUNT_POINTS[$mount_name]:-$ROOT_DIR_PATH/$mount_name}"
+}
+
+log_file_for() {
+  local mount_name="$1"
+  printf '%s/%s-rclone-mount.log\n' "$LOG_DIR" "$mount_name"
+}
+
+pid_file_for() {
+  local mount_name="$1"
+  printf '%s/%s.pid\n' "$STATE_DIR" "$mount_name"
+}
+
+directory_has_entries() {
+  local dir="$1"
+  local entries=()
+
+  shopt -s nullglob dotglob
+  entries=("$dir"/*)
+  shopt -u nullglob dotglob
+
+  ((${#entries[@]} > 0))
+}
+
+validate_mount_point_safe() {
+  local mount_name="$1"
+  local mount_point="$2"
+
+  mkdir -p "$mount_point"
+
+  if mountpoint -q "$mount_point"; then
+    return 0
+  fi
+
+  if is_true "$REQUIRE_EMPTY_MOUNTPOINT" && directory_has_entries "$mount_point"; then
+    die "Mount point for $mount_name is not empty: $mount_point"
+  fi
+}
+
+check_remote_available() {
+  local mount_name="$1"
+  local remote="$2"
+  local attempt=1
+
+  case "$CONNECTIVITY_CHECK" in
+    off) return 0 ;;
+    remote) ;;
+    *) die "Unsupported CONNECTIVITY_CHECK value: $CONNECTIVITY_CHECK" ;;
+  esac
+
+  while ((attempt <= CONNECTIVITY_RETRIES)); do
+    log "Checking remote availability for $mount_name ($remote), attempt $attempt/$CONNECTIVITY_RETRIES"
+
+    if timeout "$CONNECTIVITY_TIMEOUT_SECONDS" rclone lsf "$remote" --max-depth 1 --log-level ERROR >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if ((attempt < CONNECTIVITY_RETRIES)); then
+      sleep "$CONNECTIVITY_INTERVAL_SECONDS"
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  log "Remote check failed for $mount_name after $CONNECTIVITY_RETRIES attempts"
+  return 1
+}
+
+wait_until_mounted() {
+  local mount_point="$1"
+  local timeout_seconds="$2"
+  local waited=0
+
+  while ((waited < timeout_seconds)); do
+    if mountpoint -q "$mount_point"; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  return 1
+}
+
+wait_until_unmounted() {
+  local mount_point="$1"
+  local timeout_seconds="$2"
+  local waited=0
+
+  while ((waited < timeout_seconds)); do
+    if ! mountpoint -q "$mount_point"; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  return 1
+}
+
+unmount_with_available_tool() {
+  local mount_point="$1"
+  local mode="${2:-normal}"
+
+  if command -v fusermount3 >/dev/null 2>&1; then
+    if [[ "$mode" == "lazy" ]]; then
+      fusermount3 -uz "$mount_point"
+    else
+      fusermount3 -u "$mount_point"
+    fi
+  elif command -v fusermount >/dev/null 2>&1; then
+    if [[ "$mode" == "lazy" ]]; then
+      fusermount -uz "$mount_point"
+    else
+      fusermount -u "$mount_point"
+    fi
+  else
+    umount "$mount_point"
+  fi
+}
+
+start_one_daemon() {
+  local mount_name="$1"
+  local remote="${REMOTES[$mount_name]}"
+  local mount_point
+  local log_file
+  local custom_options
+
+  mount_point="$(mount_point_for "$mount_name")"
+  log_file="$(log_file_for "$mount_name")"
+  custom_options="${MOUNT_OPTIONS[$mount_name]:-}"
+
+  validate_mount_point_safe "$mount_name" "$mount_point"
+  touch "$log_file" || die "Log file is not writable: $log_file"
+
+  if mountpoint -q "$mount_point"; then
+    log "$mount_name is already mounted at $mount_point"
+    return 0
+  fi
+
+  check_remote_available "$mount_name" "$remote" || return 1
+  log "Mounting $remote at $mount_point"
+
+  # custom_options is intentionally word-split for simple rclone option pairs.
+  # shellcheck disable=SC2086
+  if ! rclone mount "$remote" "$mount_point" \
+    "${DEFAULT_OPTIONS[@]}" \
+    $custom_options \
+    --log-file "$log_file" \
+    --log-level INFO \
+    --daemon; then
+    log "rclone mount failed for $mount_name"
+    return 1
+  fi
+
+  if wait_until_mounted "$mount_point" "$START_TIMEOUT_SECONDS"; then
+    log "Mounted $mount_name at $mount_point; logging to $log_file"
+    STARTED_MOUNTS+=("$mount_name")
+    return 0
+  fi
+
+  log "Mount did not become active for $mount_name within ${START_TIMEOUT_SECONDS}s"
+  return 1
+}
+
+start_one_foreground() {
+  local mount_name="$1"
+  local remote="${REMOTES[$mount_name]}"
+  local mount_point
+  local log_file
+  local pid_file
+  local custom_options
+
+  mount_point="$(mount_point_for "$mount_name")"
+  log_file="$(log_file_for "$mount_name")"
+  pid_file="$(pid_file_for "$mount_name")"
+  custom_options="${MOUNT_OPTIONS[$mount_name]:-}"
+
+  validate_mount_point_safe "$mount_name" "$mount_point"
+  touch "$log_file" || die "Log file is not writable: $log_file"
+
+  if mountpoint -q "$mount_point"; then
+    log "$mount_name is already mounted at $mount_point"
+    return 0
+  fi
+
+  check_remote_available "$mount_name" "$remote" || return 1
+  log "Starting supervised mount $remote at $mount_point"
+
+  # custom_options is intentionally word-split for simple rclone option pairs.
+  # shellcheck disable=SC2086
+  rclone mount "$remote" "$mount_point" \
+    "${DEFAULT_OPTIONS[@]}" \
+    $custom_options \
+    --log-file "$log_file" \
+    --log-level INFO &
+
+  printf '%s\n' "$!" > "$pid_file"
+
+  if wait_until_mounted "$mount_point" "$START_TIMEOUT_SECONDS"; then
+    log "Mounted $mount_name at $mount_point; rclone pid $(<"$pid_file")"
+    STARTED_MOUNTS+=("$mount_name")
+    return 0
+  fi
+
+  log "Mount did not become active for $mount_name within ${START_TIMEOUT_SECONDS}s"
+  kill "$(cat "$pid_file")" >/dev/null 2>&1 || true
+  rm -f "$pid_file"
+  return 1
+}
+
+stop_one() {
+  local mount_name="$1"
+  local mount_point
+  local pid_file
+
+  mount_point="$(mount_point_for "$mount_name")"
+  pid_file="$(pid_file_for "$mount_name")"
+
+  if ! mountpoint -q "$mount_point"; then
+    log "$mount_name is not mounted"
+    rm -f "$pid_file"
+    return 0
+  fi
+
+  log "Unmounting $mount_name from $mount_point"
+
+  if ! unmount_with_available_tool "$mount_point" normal; then
+    log "Normal unmount failed for $mount_name; waiting before lazy fallback"
+  fi
+
+  if wait_until_unmounted "$mount_point" "$STOP_TIMEOUT_SECONDS"; then
+    log "Unmounted $mount_name"
+    rm -f "$pid_file"
+    return 0
+  fi
+
+  log "$mount_name is still mounted after ${STOP_TIMEOUT_SECONDS}s; trying lazy unmount"
+  unmount_with_available_tool "$mount_point" lazy || true
+
+  if wait_until_unmounted "$mount_point" 5; then
+    log "Lazy-unmounted $mount_name"
+    rm -f "$pid_file"
+    return 0
+  fi
+
+  if [[ -f "$pid_file" ]]; then
+    log "Sending SIGTERM to recorded rclone pid $(<"$pid_file") for $mount_name"
+    kill "$(cat "$pid_file")" >/dev/null 2>&1 || true
+  fi
+
+  log "Failed to unmount $mount_name from $mount_point"
+  return 1
+}
+
+start_all_daemon() {
+  ensure_requirements_for_start
+  ensure_directories
+
+  local mount_name
+  for mount_name in "${MOUNTS[@]}"; do
+    if ! start_one_daemon "$mount_name"; then
+      log "Failed to start $mount_name"
+      if is_true "$ROLLBACK_ON_START_FAILURE"; then
+        log "Rolling back already-started mounts"
+        stop_started_mounts || true
+      fi
+      return 1
+    fi
+  done
+
+  log "All configured mounts are started"
+}
+
+start_all_foreground() {
+  ensure_requirements_for_start
+  ensure_directories
+
+  local mount_name
+  for mount_name in "${MOUNTS[@]}"; do
+    if ! start_one_foreground "$mount_name"; then
+      log "Failed to start $mount_name"
+      stop_started_mounts || true
+      return 1
+    fi
+  done
+
+  log "All configured mounts are running under supervision"
+}
+
+stop_all() {
+  require_command mountpoint
+  ensure_directories
+
+  local index
+  local mount_name
+
+  for ((index = ${#MOUNTS[@]} - 1; index >= 0; index--)); do
+    mount_name="${MOUNTS[$index]}"
+    stop_one "$mount_name"
+  done
+}
+
+stop_started_mounts() {
+  require_command mountpoint
+  ensure_directories
+
+  local index
+  local mount_name
+
+  for ((index = ${#STARTED_MOUNTS[@]} - 1; index >= 0; index--)); do
+    mount_name="${STARTED_MOUNTS[$index]}"
+    stop_one "$mount_name"
+  done
+}
+
+status_all() {
+  require_command mountpoint
+  ensure_directories
+
+  local mount_name
+  local mount_point
+  local pid_file
+  local pid_status
+
+  for mount_name in "${MOUNTS[@]}"; do
+    mount_point="$(mount_point_for "$mount_name")"
+    pid_file="$(pid_file_for "$mount_name")"
+    pid_status=""
+
+    if [[ -f "$pid_file" ]]; then
+      pid_status=" pid=$(<"$pid_file")"
+    fi
+
+    if mountpoint -q "$mount_point"; then
+      printf '%-28s mounted     %s%s\n' "$mount_name" "$mount_point" "$pid_status"
+    else
+      printf '%-28s not mounted %s%s\n' "$mount_name" "$mount_point" "$pid_status"
+    fi
+  done
+}
+
+run_supervised() {
+  trap 'log "Termination requested"; stop_all; exit 0' INT TERM HUP
+
+  start_all_foreground
+
+  while true; do
+    local mount_name
+    local mount_point
+
+    for mount_name in "${MOUNTS[@]}"; do
+      mount_point="$(mount_point_for "$mount_name")"
+      if ! mountpoint -q "$mount_point"; then
+        log "$mount_name is no longer mounted; stopping remaining mounts"
+        stop_all || true
+        exit 1
+      fi
+    done
+
+    sleep 5
+  done
+}
+
+print_config() {
+  printf 'APP_NAME=%s\n' "$APP_NAME"
+  printf 'VERSION=%s\n' "$VERSION"
+  printf 'CONFIG_FILE=%s\n' "${CONFIG_FILE:-<none>}"
+  printf 'MODE=%s\n' "$MODE"
+  printf 'ROOT_DIR_PATH=%s\n' "$ROOT_DIR_PATH"
+  printf 'LOG_DIR=%s\n' "$LOG_DIR"
+  printf 'STATE_DIR=%s\n' "$STATE_DIR"
+  printf 'CONNECTIVITY_CHECK=%s\n' "$CONNECTIVITY_CHECK"
+  printf 'REQUIRE_EMPTY_MOUNTPOINT=%s\n' "$REQUIRE_EMPTY_MOUNTPOINT"
+  printf 'ROLLBACK_ON_START_FAILURE=%s\n' "$ROLLBACK_ON_START_FAILURE"
+  printf 'MOUNTS=%s\n' "${MOUNTS[*]:-}"
+}
+
+doctor_check() {
+  local label="$1"
+  local command="$2"
+
+  if command -v "$command" >/dev/null 2>&1; then
+    printf 'ok   %s: %s\n' "$label" "$(command -v "$command")"
+    return 0
+  fi
+
+  printf 'fail %s: missing %s\n' "$label" "$command"
+  return 1
+}
+
+doctor() {
+  local failures=0
+  local mount_name
+  local mount_point
+  local remote
+
+  print_config
+  printf '\nChecks:\n'
+
+  doctor_check "rclone" rclone || failures=$((failures + 1))
+  doctor_check "mountpoint" mountpoint || failures=$((failures + 1))
+  doctor_check "timeout" timeout || failures=$((failures + 1))
+
+  if command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1 || command -v umount >/dev/null 2>&1; then
+    printf 'ok   unmount tool available\n'
+  else
+    printf 'fail no unmount tool found: fusermount3, fusermount, or umount\n'
+    failures=$((failures + 1))
+  fi
+
+  if ((${#MOUNTS[@]} == 0)); then
+    printf 'fail config: no mounts configured\n'
+    failures=$((failures + 1))
+  fi
+
+  ensure_directories
+
+  [[ -w "$ROOT_DIR_PATH" ]] && printf 'ok   root dir writable: %s\n' "$ROOT_DIR_PATH" || {
+    printf 'fail root dir not writable: %s\n' "$ROOT_DIR_PATH"
+    failures=$((failures + 1))
+  }
+  [[ -w "$LOG_DIR" ]] && printf 'ok   log dir writable: %s\n' "$LOG_DIR" || {
+    printf 'fail log dir not writable: %s\n' "$LOG_DIR"
+    failures=$((failures + 1))
+  }
+  [[ -w "$STATE_DIR" ]] && printf 'ok   state dir writable: %s\n' "$STATE_DIR" || {
+    printf 'fail state dir not writable: %s\n' "$STATE_DIR"
+    failures=$((failures + 1))
+  }
+
+  for mount_name in "${MOUNTS[@]}"; do
+    mount_point="$(mount_point_for "$mount_name")"
+    remote="${REMOTES[$mount_name]:-}"
+
+    [[ -n "$remote" ]] || {
+      printf 'fail %s: missing remote\n' "$mount_name"
+      failures=$((failures + 1))
+      continue
+    }
+
+    printf 'ok   %s remote: %s\n' "$mount_name" "$remote"
+    mkdir -p "$mount_point"
+    [[ -w "$mount_point" ]] && printf 'ok   %s mount point writable: %s\n' "$mount_name" "$mount_point" || {
+      printf 'fail %s mount point not writable: %s\n' "$mount_name" "$mount_point"
+      failures=$((failures + 1))
+    }
+  done
+
+  if [[ "$MODE" == "system" && " ${DEFAULT_OPTIONS[*]} " == *" --allow-other "* ]]; then
+    if [[ -r /etc/fuse.conf ]] && grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf; then
+      printf 'ok   /etc/fuse.conf allows --allow-other\n'
+    else
+      printf 'fail --allow-other requires user_allow_other in /etc/fuse.conf\n'
+      failures=$((failures + 1))
+    fi
+  fi
+
+  if ((failures > 0)); then
+    return 1
+  fi
+}
+
+main() {
+  local command="${1:-help}"
+
+  case "$command" in
+    help|--help|-h)
+      usage
+      ;;
+    start)
+      load_config
+      validate_config
+      start_all_daemon
+      ;;
+    stop)
+      load_config
+      validate_config
+      stop_all
+      ;;
+    restart)
+      load_config
+      validate_config
+      stop_all
+      start_all_daemon
+      ;;
+    status)
+      load_config
+      validate_config
+      status_all
+      ;;
+    run)
+      load_config
+      validate_config
+      run_supervised
+      ;;
+    doctor)
+      load_config
+      doctor
+      ;;
+    print-config)
+      load_config
+      print_config
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
