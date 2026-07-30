@@ -56,7 +56,7 @@ Check:
 ```bash
 systemctl --user status rclone-mount-manager.service
 journalctl --user -u rclone-mount-manager.service -f
-rclone-mount-manager status
+rclone-mount status
 ```
 
 Default user mount root:
@@ -128,17 +128,18 @@ Put that in `/etc/rclone-mount-manager/config`.
 
 ## Commands
 
+The installer creates `rclone-mount` as a convenience command unless `--no-alias` is used. The full command remains available.
+
 ```bash
-rclone-mount-manager start
-rclone-mount-manager stop
-rclone-mount-manager restart
-rclone-mount-manager status
-rclone-mount-manager run
-rclone-mount-manager doctor
-rclone-mount-manager print-config
+rclone-mount start
+rclone-mount stop
+rclone-mount restart
+rclone-mount status
+rclone-mount doctor
+rclone-mount print-config
 ```
 
-Use `run` only from systemd. It keeps the manager in the foreground, supervises mounts, and traps termination signals so shutdown/logout can unmount cleanly.
+Use `rclone-mount-manager run` only from systemd. It keeps the manager in the foreground, supervises mounts, and traps termination signals so shutdown/logout can unmount cleanly.
 
 ## Connectivity behavior
 
@@ -189,14 +190,14 @@ Configuration files are executable Bash and must be trusted.
 
 The installer writes configs with owner-only file permissions because users may add environment variables such as `RCLONE_CONFIG`, `RCLONE_CONFIG_PASS`, or provider-specific credentials.
 
-Before publishing this project publicly, add a `LICENSE` file. MIT is a practical default for a small utility, but the repository owner should choose the license explicitly.
+This project is licensed under the MIT License.
 
 ## Troubleshooting
 
 Run:
 
 ```bash
-rclone-mount-manager doctor
+rclone-mount doctor
 ```
 
 Common issues:

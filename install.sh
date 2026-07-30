@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="rclone-mount-manager"
+SHORT_NAME="rclone-mount"
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 
 MODE=""
@@ -9,6 +10,7 @@ ENABLE_SERVICE=false
 START_SERVICE=false
 FORCE=false
 DRY_RUN=false
+INSTALL_SHORT_ALIAS=true
 
 usage() {
   cat <<EOF
@@ -20,6 +22,7 @@ Options:
   --enable     Enable the systemd service after installing.
   --start      Start the systemd service after installing. Implies --enable.
   --force      Overwrite existing binary, unit, and config.
+  --no-alias   Do not install the rclone-mount convenience command.
   --dry-run    Print planned actions without writing.
   -h, --help   Show this help.
 EOF
@@ -87,6 +90,33 @@ install_config() {
   run install -m "$mode" "$source" "$target"
 }
 
+install_short_alias() {
+  local bin_dir="$1"
+  local bin_path="$2"
+  local alias_path="$bin_dir/$SHORT_NAME"
+  local existing_command=""
+
+  [[ "$INSTALL_SHORT_ALIAS" == "true" ]] || return 0
+
+  existing_command="$(command -v "$SHORT_NAME" 2>/dev/null || true)"
+
+  if [[ -n "$existing_command" && "$existing_command" != "$alias_path" && "$FORCE" != "true" ]]; then
+    die "$SHORT_NAME already exists at $existing_command. Use --no-alias or --force."
+  fi
+
+  if [[ -e "$alias_path" && "$FORCE" != "true" ]]; then
+    die "Alias path exists: $alias_path. Use --no-alias or --force."
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "dry-run: install alias $alias_path -> $bin_path"
+    return 0
+  fi
+
+  rm -f "$alias_path"
+  ln -s "$(basename -- "$bin_path")" "$alias_path"
+}
+
 parse_args() {
   while (($# > 0)); do
     case "$1" in
@@ -105,6 +135,9 @@ parse_args() {
         ;;
       --force)
         FORCE=true
+        ;;
+      --no-alias)
+        INSTALL_SHORT_ALIAS=false
         ;;
       --dry-run)
         DRY_RUN=true
@@ -135,6 +168,7 @@ install_user() {
   run mkdir -p "$bin_dir" "$config_dir" "$systemd_dir"
   run chmod 0700 "$config_dir"
   run install -m 0755 "$PROJECT_DIR/bin/$APP_NAME" "$bin_path"
+  install_short_alias "$bin_dir" "$bin_path"
   install_config "$PROJECT_DIR/config/user.conf.example" "$config_file" 0600
   write_unit "$PROJECT_DIR/systemd/user/$APP_NAME.service" "$unit_file" "$bin_path" "$config_file"
   run systemctl --user daemon-reload
@@ -148,6 +182,10 @@ install_user() {
   fi
 
   log "Installed user mode."
+  log "Command: $bin_path"
+  if [[ "$INSTALL_SHORT_ALIAS" == "true" ]]; then
+    log "Alias:   $bin_dir/$SHORT_NAME"
+  fi
   log "Edit config: $config_file"
 }
 
@@ -166,6 +204,7 @@ install_system() {
   run mkdir -p "$bin_dir" "$config_dir" "$systemd_dir"
   run chmod 0755 "$config_dir"
   run install -m 0755 "$PROJECT_DIR/bin/$APP_NAME" "$bin_path"
+  install_short_alias "$bin_dir" "$bin_path"
   install_config "$PROJECT_DIR/config/system.conf.example" "$config_file" 0600
   write_unit "$PROJECT_DIR/systemd/system/$APP_NAME.service" "$unit_file" "$bin_path" "$config_file"
   run systemctl daemon-reload
@@ -179,6 +218,10 @@ install_system() {
   fi
 
   log "Installed system mode."
+  log "Command: $bin_path"
+  if [[ "$INSTALL_SHORT_ALIAS" == "true" ]]; then
+    log "Alias:   $bin_dir/$SHORT_NAME"
+  fi
   log "Edit config: $config_file"
 }
 

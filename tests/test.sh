@@ -87,17 +87,72 @@ EOF
 test_install_dry_run() {
   local output
 
-  output="$(HOME=/tmp/rmm-test-home "$PROJECT_DIR/install.sh" --user --dry-run --enable)"
+  output="$(HOME=/tmp/rclone-mount-test-home "$PROJECT_DIR/install.sh" --user --dry-run --enable)"
   assert_contains "$output" "dry-run:"
   assert_contains "$output" "systemctl"
+  assert_contains "$output" "install alias"
 }
 
 test_uninstall_dry_run() {
   local output
 
-  output="$(HOME=/tmp/rmm-test-home "$PROJECT_DIR/uninstall.sh" --user --dry-run --remove-config)"
+  output="$(HOME=/tmp/rclone-mount-test-home "$PROJECT_DIR/uninstall.sh" --user --dry-run --remove-config)"
   assert_contains "$output" "dry-run:"
   assert_contains "$output" "rm -rf"
+}
+
+test_uninstall_removes_owned_alias_only() {
+  local temp_dir
+  local fake_systemctl
+  local home_dir
+
+  temp_dir="$(mktemp -d)"
+  fake_systemctl="$temp_dir/bin/systemctl"
+  home_dir="$temp_dir/home"
+
+  mkdir -p "$temp_dir/bin" "$home_dir/.local/bin"
+  cat > "$fake_systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$fake_systemctl"
+
+  touch "$home_dir/.local/bin/rclone-mount-manager"
+  ln -s rclone-mount-manager "$home_dir/.local/bin/rclone-mount"
+
+  HOME="$home_dir" PATH="$temp_dir/bin:$PATH" "$PROJECT_DIR/uninstall.sh" --user
+
+  [[ ! -e "$home_dir/.local/bin/rclone-mount" ]] || fail "owned alias should be removed"
+
+  rm -rf "$temp_dir"
+}
+
+test_uninstall_keeps_unowned_alias() {
+  local temp_dir
+  local fake_systemctl
+  local home_dir
+  local output
+
+  temp_dir="$(mktemp -d)"
+  fake_systemctl="$temp_dir/bin/systemctl"
+  home_dir="$temp_dir/home"
+
+  mkdir -p "$temp_dir/bin" "$home_dir/.local/bin"
+  cat > "$fake_systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$fake_systemctl"
+
+  touch "$home_dir/.local/bin/other-tool"
+  ln -s other-tool "$home_dir/.local/bin/rclone-mount"
+
+  output="$(HOME="$home_dir" PATH="$temp_dir/bin:$PATH" "$PROJECT_DIR/uninstall.sh" --user)"
+
+  [[ -L "$home_dir/.local/bin/rclone-mount" ]] || fail "unowned alias should be kept"
+  assert_contains "$output" "Keeping alias not owned"
+
+  rm -rf "$temp_dir"
 }
 
 main() {
@@ -106,6 +161,8 @@ main() {
   test_status_with_mock_mountpoint
   test_install_dry_run
   test_uninstall_dry_run
+  test_uninstall_removes_owned_alias_only
+  test_uninstall_keeps_unowned_alias
 
   printf 'All tests passed.\n'
 }
