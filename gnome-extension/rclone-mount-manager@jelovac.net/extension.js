@@ -18,6 +18,7 @@ Gio._promisify(
 const APP_NAME = 'rclone-mount-manager';
 const UNIT_NAME = `${APP_NAME}.service`;
 const REFRESH_SECONDS = 10;
+const PROJECT_URL = 'https://github.com/jelovac/rclone-mount-manager';
 
 async function runCapture(argv, cancellable = null) {
     const process = Gio.Subprocess.new(
@@ -216,6 +217,8 @@ class RcloneIndicator extends PanelMenu.Button {
         this._addServiceActions(service);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this._addFileActions(managerStatus);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._addAboutMenu(managerStatus);
 
         const refreshItem = new PopupMenu.PopupMenuItem(_('Refresh'));
         refreshItem.connect('activate', () => this._extension.refresh());
@@ -317,6 +320,29 @@ class RcloneIndicator extends PanelMenu.Button {
         const diagnostics = new PopupMenu.PopupMenuItem(_('Run Diagnostics'));
         diagnostics.connect('activate', () => this._extension.openDiagnostics());
         this.menu.addMenuItem(diagnostics);
+    }
+
+    _addAboutMenu(managerStatus) {
+        const about = new PopupMenu.PopupSubMenuMenuItem(_('About RMM'), true);
+        const details = [
+            [_('Version'), managerStatus?.version ?? _('Unavailable')],
+            [_('Author'), 'Vladimir Jelovac'],
+            [_('Copyright'), '© 2026 Vladimir Jelovac'],
+            [_('License'), 'MIT License'],
+        ];
+
+        for (const [label, value] of details) {
+            about.menu.addMenuItem(new PopupMenu.PopupMenuItem(`${label}: ${value}`, {
+                reactive: false,
+                can_focus: false,
+            }));
+        }
+
+        about.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        const repository = new PopupMenu.PopupMenuItem(_('Open GitHub Repository'));
+        repository.connect('activate', () => this._extension.openPath(PROJECT_URL));
+        about.menu.addMenuItem(repository);
+        this.menu.addMenuItem(about);
     }
 });
 

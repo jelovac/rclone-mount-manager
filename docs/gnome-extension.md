@@ -65,7 +65,9 @@ Each mount submenu shows its current state and provides:
 
 The global menu provides manager Start, Stop, and Restart actions, an Enable at
 Login toggle, configuration and log-folder shortcuts, a live journal view, and
-the built-in diagnostics command.
+the built-in diagnostics command. An **About RMM** submenu shows the installed
+manager version, author, copyright, MIT license, and a link to the GitHub
+repository.
 
 Commands run asynchronously and use fixed argument arrays; the extension does
 not evaluate configuration content or construct shell command strings.

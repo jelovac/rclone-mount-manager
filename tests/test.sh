@@ -97,6 +97,10 @@ test_gnome_indicator_registers_gobject_type() {
   assert_not_contains "$source" "const [, stdout, stderr]"
   assert_contains "$source" "text: 'RMM'"
   assert_contains "$source" "[this.binary, 'doctor', '--wait']"
+  assert_contains "$source" "_('About RMM')"
+  assert_contains "$source" "© 2026 Vladimir Jelovac"
+  assert_contains "$source" "MIT License"
+  assert_contains "$source" "https://github.com/jelovac/rclone-mount-manager"
 }
 
 test_doctor_waits_for_confirmation() {
