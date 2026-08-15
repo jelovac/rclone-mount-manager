@@ -3,15 +3,16 @@ Description=rclone mount manager shared system mounts
 Documentation=man:rclone(1)
 Wants=network-online.target
 After=network-online.target
-StartLimitIntervalSec=0
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 Environment=RMM_CONFIG_FILE=@CONFIG_FILE@
 ExecStart=@BIN_PATH@ run
-ExecStop=@BIN_PATH@ stop
 Restart=on-failure
 RestartSec=10
+KillMode=mixed
 TimeoutStopSec=45
 
 [Install]

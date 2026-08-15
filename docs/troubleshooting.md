@@ -40,6 +40,22 @@ Find `LOG_DIR` with:
 rclone-mount print-config
 ```
 
+## One Mount Keeps Failing
+
+Check the per-mount state:
+
+```bash
+rclone-mount status
+```
+
+A failing mount is shown as `retrying` with its next attempt time and last
+failure. Other mounts should remain `mounted`; their rclone processes are not
+restarted.
+
+The retry sequence is controlled by `RETRY_DELAYS_SECONDS`. Inspect the failed
+mount's rclone log before shortening the delays. Repeated fast retries can add
+load without resolving remote, credential, or network failures.
+
 ## Remote Not Found
 
 Check the remote name:

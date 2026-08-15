@@ -9,6 +9,7 @@ MODE=""
 ENABLE_SERVICE=false
 START_SERVICE=false
 FORCE=false
+FORCE_CONFIG=false
 DRY_RUN=false
 INSTALL_SHORT_ALIAS=true
 
@@ -21,7 +22,9 @@ Options:
   --system     Install globally using system systemd.
   --enable     Enable the systemd service after installing.
   --start      Start the systemd service after installing. Implies --enable.
-  --force      Overwrite existing binary, unit, and config.
+  --force      Overwrite the existing binary and unit; keep the config.
+  --force-config
+               Also overwrite the existing config. Requires --force.
   --no-alias   Do not install the rclone-mount convenience command.
   --dry-run    Print planned actions without writing.
   -h, --help   Show this help.
@@ -82,7 +85,7 @@ install_config() {
   local target="$2"
   local mode="$3"
 
-  if [[ -e "$target" && "$FORCE" != "true" ]]; then
+  if [[ -e "$target" && "$FORCE_CONFIG" != "true" ]]; then
     log "Keeping existing config: $target"
     return 0
   fi
@@ -136,6 +139,9 @@ parse_args() {
       --force)
         FORCE=true
         ;;
+      --force-config)
+        FORCE_CONFIG=true
+        ;;
       --no-alias)
         INSTALL_SHORT_ALIAS=false
         ;;
@@ -155,6 +161,7 @@ parse_args() {
   done
 
   [[ -n "$MODE" ]] || die "Choose --user or --system."
+  [[ "$FORCE_CONFIG" != "true" || "$FORCE" == "true" ]] || die "--force-config requires --force."
 }
 
 install_user() {

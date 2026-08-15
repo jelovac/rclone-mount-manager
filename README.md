@@ -6,6 +6,9 @@ This project is for Linux systems where rclone mounts should start
 automatically, restart after failures, and unmount cleanly during logout or
 shutdown.
 
+Each configured mount is supervised independently. A mount failure is cleaned
+up and retried without restarting healthy mounts.
+
 ## Requirements
 
 - Linux with systemd

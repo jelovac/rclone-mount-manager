@@ -33,6 +33,9 @@ REMOTES=(
 `MOUNTS` contains local mount names. `REMOTES` maps each mount name to an rclone
 remote.
 
+Mount names must start with a letter or number and may contain letters, numbers,
+dots, underscores, and dashes. Names and resolved mount paths must be unique.
+
 The remote value must be a valid rclone remote path, such as:
 
 ```bash
@@ -132,12 +135,36 @@ Allow non-empty mount points only if you know why:
 REQUIRE_EMPTY_MOUNTPOINT=false
 ```
 
-If startup fails after some mounts started, the manager unmounts the mounts it
-started:
+Manual `start` attempts every configured mount and leaves successful mounts
+active by default:
 
 ```bash
-ROLLBACK_ON_START_FAILURE=true
+ROLLBACK_ON_START_FAILURE=false
 ```
+
+Set this to `true` only when manual batch startup must be transactional. The
+systemd `run` mode always isolates failures and does not roll back healthy
+mounts.
+
+## Supervision And Retries
+
+The systemd service checks every mount independently:
+
+```bash
+HEALTH_CHECK_INTERVAL_SECONDS=5
+RETRY_DELAYS_SECONDS=(10 30 60 300)
+RETRY_RESET_SECONDS=600
+SUPERVISOR_RESTART_DELAY_SECONDS=30
+```
+
+`RETRY_DELAYS_SECONDS` is the backoff sequence for a mount that cannot start or
+becomes unhealthy. Once the sequence is exhausted, the last value is reused.
+After a mount stays healthy for `RETRY_RESET_SECONDS`, its next failure starts
+again at the first delay.
+
+`SUPERVISOR_RESTART_DELAY_SECONDS` applies only if an individual supervisor
+subprocess exits unexpectedly. Normal rclone or mount failures remain inside
+that supervisor's retry loop.
 
 ## Logs And State
 

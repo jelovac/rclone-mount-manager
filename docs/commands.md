@@ -90,6 +90,7 @@ rclone-mount-manager run
 ```
 
 It keeps the manager in the foreground, starts rclone mount processes, watches
-them, and stops remaining mounts if one disappears.
+each one with an independent supervisor, and retries only the mount that fails.
+Healthy mounts are not restarted when another mount is unavailable.
 
 Use `systemctl` for normal service management.

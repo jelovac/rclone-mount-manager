@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="rclone-mount-manager"
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 USER_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME/config"
 SYSTEM_CONFIG_FILE="/etc/$APP_NAME/config"
@@ -19,7 +19,12 @@ CONNECTIVITY_RETRIES="${RMM_CONNECTIVITY_RETRIES:-12}"
 CONNECTIVITY_INTERVAL_SECONDS="${RMM_CONNECTIVITY_INTERVAL_SECONDS:-5}"
 CONNECTIVITY_TIMEOUT_SECONDS="${RMM_CONNECTIVITY_TIMEOUT_SECONDS:-15}"
 REQUIRE_EMPTY_MOUNTPOINT="${RMM_REQUIRE_EMPTY_MOUNTPOINT:-true}"
-ROLLBACK_ON_START_FAILURE="${RMM_ROLLBACK_ON_START_FAILURE:-true}"
+ROLLBACK_ON_START_FAILURE="${RMM_ROLLBACK_ON_START_FAILURE:-false}"
+HEALTH_CHECK_INTERVAL_SECONDS="${RMM_HEALTH_CHECK_INTERVAL_SECONDS:-5}"
+RETRY_RESET_SECONDS="${RMM_RETRY_RESET_SECONDS:-600}"
+SUPERVISOR_RESTART_DELAY_SECONDS="${RMM_SUPERVISOR_RESTART_DELAY_SECONDS:-30}"
+
+RETRY_DELAYS_SECONDS=(10 30 60 300)
 
 DEFAULT_OPTIONS=(
   --vfs-cache-mode full
@@ -37,6 +42,8 @@ STARTED_MOUNTS=()
 declare -A REMOTES=()
 declare -A MOUNT_POINTS=()
 declare -A MOUNT_OPTIONS=()
+declare -A SUPERVISOR_PIDS=()
+declare -A SUPERVISOR_RESTART_AT=()
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -157,12 +164,44 @@ load_config() {
 
 validate_config() {
   local mount_name
+  local mount_point
+  local retry_delay
+  declare -A seen_mounts=()
+  declare -A seen_mount_points=()
 
   ((${#MOUNTS[@]} > 0)) || die "No mounts configured. Create/edit a config file first."
+  [[ "$START_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "START_TIMEOUT_SECONDS must be a positive integer."
+  [[ "$STOP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "STOP_TIMEOUT_SECONDS must be a positive integer."
+  [[ "$HEALTH_CHECK_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "HEALTH_CHECK_INTERVAL_SECONDS must be a positive integer."
+  [[ "$RETRY_RESET_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "RETRY_RESET_SECONDS must be a positive integer."
+  [[ "$SUPERVISOR_RESTART_DELAY_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "SUPERVISOR_RESTART_DELAY_SECONDS must be a positive integer."
+  ((${#RETRY_DELAYS_SECONDS[@]} > 0)) || die "RETRY_DELAYS_SECONDS must contain at least one delay."
+
+  case "$CONNECTIVITY_CHECK" in
+    off) ;;
+    remote)
+      [[ "$CONNECTIVITY_RETRIES" =~ ^[1-9][0-9]*$ ]] || die "CONNECTIVITY_RETRIES must be a positive integer."
+      [[ "$CONNECTIVITY_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "CONNECTIVITY_INTERVAL_SECONDS must be a positive integer."
+      [[ "$CONNECTIVITY_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "CONNECTIVITY_TIMEOUT_SECONDS must be a positive integer."
+      ;;
+    *) die "Unsupported CONNECTIVITY_CHECK value: $CONNECTIVITY_CHECK" ;;
+  esac
+
+  for retry_delay in "${RETRY_DELAYS_SECONDS[@]}"; do
+    [[ "$retry_delay" =~ ^[1-9][0-9]*$ ]] || die "RETRY_DELAYS_SECONDS values must be positive integers."
+  done
 
   for mount_name in "${MOUNTS[@]}"; do
     [[ -n "$mount_name" ]] || die "Mount names must not be empty."
+    [[ "$mount_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid mount name '$mount_name'. Use letters, numbers, dots, underscores, and dashes."
+    [[ -z "${seen_mounts[$mount_name]:-}" ]] || die "Duplicate mount name: $mount_name"
+    seen_mounts[$mount_name]=1
     [[ -n "${REMOTES[$mount_name]:-}" ]] || die "Missing REMOTES[$mount_name]."
+
+    mount_point="$(mount_point_for "$mount_name")"
+    [[ "$mount_point" == /* ]] || die "Mount point for $mount_name must be an absolute path: $mount_point"
+    [[ -z "${seen_mount_points[$mount_point]:-}" ]] || die "Mount point is configured more than once: $mount_point"
+    seen_mount_points[$mount_point]="$mount_name"
   done
 }
 
@@ -194,7 +233,7 @@ ensure_state_directory() {
     die "State path exists but is not a directory: $STATE_DIR"
   fi
 
-  mkdir -p -m 0700 "$STATE_DIR"
+  mkdir -p "$STATE_DIR"
 
   state_owner="$(stat -c '%u' "$STATE_DIR")"
   state_mode="$(stat -c '%a' "$STATE_DIR")"
@@ -221,6 +260,53 @@ pid_file_for() {
   printf '%s/%s.pid\n' "$STATE_DIR" "$mount_name"
 }
 
+status_file_for() {
+  local mount_name="$1"
+  printf '%s/%s.status\n' "$STATE_DIR" "$mount_name"
+}
+
+write_mount_state() {
+  local mount_name="$1"
+  local status="$2"
+  local failures="${3:-0}"
+  local next_retry="${4:-0}"
+  local last_error="${5:-}"
+  local status_file
+  local temporary_file
+
+  status_file="$(status_file_for "$mount_name")"
+  temporary_file="$status_file.tmp.$BASHPID"
+  last_error="${last_error//$'\n'/ }"
+
+  {
+    printf 'status=%s\n' "$status"
+    printf 'failures=%s\n' "$failures"
+    printf 'next_retry=%s\n' "$next_retry"
+    printf 'last_error=%s\n' "$last_error"
+  } > "$temporary_file"
+  mv -f "$temporary_file" "$status_file"
+}
+
+read_mount_state_field() {
+  local mount_name="$1"
+  local requested_field="$2"
+  local status_file
+  local field
+  local value
+
+  status_file="$(status_file_for "$mount_name")"
+  [[ -r "$status_file" ]] || return 1
+
+  while IFS='=' read -r field value; do
+    if [[ "$field" == "$requested_field" ]]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done < "$status_file"
+
+  return 1
+}
+
 directory_has_entries() {
   local dir="$1"
   local entries=()
@@ -243,8 +329,73 @@ validate_mount_point_safe() {
   fi
 
   if is_true "$REQUIRE_EMPTY_MOUNTPOINT" && directory_has_entries "$mount_point"; then
-    die "Mount point for $mount_name is not empty: $mount_point"
+    log "Mount point for $mount_name is not empty: $mount_point"
+    return 1
   fi
+}
+
+recorded_process_matches_mount() {
+  local mount_name="$1"
+  local pid="$2"
+  local remote="${REMOTES[$mount_name]}"
+  local mount_point
+  local argument
+  local found_remote=false
+  local found_mount_point=false
+
+  mount_point="$(mount_point_for "$mount_name")"
+  [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/cmdline" ]] || return 1
+
+  while IFS= read -r -d '' argument; do
+    [[ "$argument" == "$remote" ]] && found_remote=true
+    [[ "$argument" == "$mount_point" ]] && found_mount_point=true
+  done < "/proc/$pid/cmdline"
+
+  [[ "$found_remote" == "true" && "$found_mount_point" == "true" ]]
+}
+
+recorded_process_is_running() {
+  local mount_name="$1"
+  local pid_file
+  local pid
+
+  pid_file="$(pid_file_for "$mount_name")"
+  [[ -r "$pid_file" ]] || return 1
+  pid="$(<"$pid_file")"
+
+  kill -0 "$pid" >/dev/null 2>&1 && recorded_process_matches_mount "$mount_name" "$pid"
+}
+
+terminate_recorded_process() {
+  local mount_name="$1"
+  local pid_file
+  local pid
+  local waited=0
+
+  pid_file="$(pid_file_for "$mount_name")"
+  [[ -r "$pid_file" ]] || return 0
+  pid="$(<"$pid_file")"
+
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    if recorded_process_matches_mount "$mount_name" "$pid"; then
+      log "Sending SIGTERM to recorded rclone pid $pid for $mount_name"
+      kill "$pid" >/dev/null 2>&1 || true
+
+      while kill -0 "$pid" >/dev/null 2>&1 && ((waited < 5)); do
+        sleep 1
+        waited=$((waited + 1))
+      done
+
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        log "Recorded rclone pid $pid did not stop; sending SIGKILL"
+        kill -KILL "$pid" >/dev/null 2>&1 || true
+      fi
+    else
+      log "Ignoring stale pid file for $mount_name; pid $pid does not match this mount"
+    fi
+  fi
+
+  rm -f "$pid_file"
 }
 
 check_remote_available() {
@@ -279,12 +430,17 @@ check_remote_available() {
 wait_until_mounted() {
   local mount_point="$1"
   local timeout_seconds="$2"
+  local pid="${3:-}"
   local waited=0
 
-  while ((waited < timeout_seconds)); do
+  while ((waited <= timeout_seconds)); do
     if mountpoint -q "$mount_point"; then
       return 0
     fi
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" >/dev/null 2>&1; then
+      return 1
+    fi
+    ((waited < timeout_seconds)) || break
     sleep 1
     waited=$((waited + 1))
   done
@@ -297,10 +453,11 @@ wait_until_unmounted() {
   local timeout_seconds="$2"
   local waited=0
 
-  while ((waited < timeout_seconds)); do
+  while ((waited <= timeout_seconds)); do
     if ! mountpoint -q "$mount_point"; then
       return 0
     fi
+    ((waited < timeout_seconds)) || break
     sleep 1
     waited=$((waited + 1))
   done
@@ -340,8 +497,11 @@ start_one_daemon() {
   log_file="$(log_file_for "$mount_name")"
   custom_options="${MOUNT_OPTIONS[$mount_name]:-}"
 
-  validate_mount_point_safe "$mount_name" "$mount_point"
-  touch "$log_file" || die "Log file is not writable: $log_file"
+  validate_mount_point_safe "$mount_name" "$mount_point" || return 1
+  if ! touch "$log_file"; then
+    log "Log file is not writable for $mount_name: $log_file"
+    return 1
+  fi
 
   if mountpoint -q "$mount_point"; then
     log "$mount_name is already mounted at $mount_point"
@@ -379,6 +539,7 @@ start_one_foreground() {
   local mount_point
   local log_file
   local pid_file
+  local pid
   local custom_options
 
   mount_point="$(mount_point_for "$mount_name")"
@@ -386,13 +547,21 @@ start_one_foreground() {
   pid_file="$(pid_file_for "$mount_name")"
   custom_options="${MOUNT_OPTIONS[$mount_name]:-}"
 
-  validate_mount_point_safe "$mount_name" "$mount_point"
-  touch "$log_file" || die "Log file is not writable: $log_file"
+  validate_mount_point_safe "$mount_name" "$mount_point" || return 1
+  if ! touch "$log_file"; then
+    log "Log file is not writable for $mount_name: $log_file"
+    return 1
+  fi
 
   if mountpoint -q "$mount_point"; then
+    if [[ -e "$pid_file" ]] && ! recorded_process_is_running "$mount_name"; then
+      rm -f "$pid_file"
+    fi
     log "$mount_name is already mounted at $mount_point"
     return 0
   fi
+
+  terminate_recorded_process "$mount_name"
 
   check_remote_available "$mount_name" "$remote" || return 1
   log "Starting supervised mount $remote at $mount_point"
@@ -405,31 +574,28 @@ start_one_foreground() {
     --log-file "$log_file" \
     --log-level INFO &
 
-  printf '%s\n' "$!" > "$pid_file"
+  pid="$!"
+  printf '%s\n' "$pid" > "$pid_file"
 
-  if wait_until_mounted "$mount_point" "$START_TIMEOUT_SECONDS"; then
-    log "Mounted $mount_name at $mount_point; rclone pid $(<"$pid_file")"
-    STARTED_MOUNTS+=("$mount_name")
+  if wait_until_mounted "$mount_point" "$START_TIMEOUT_SECONDS" "$pid"; then
+    log "Mounted $mount_name at $mount_point; rclone pid $pid"
     return 0
   fi
 
   log "Mount did not become active for $mount_name within ${START_TIMEOUT_SECONDS}s"
-  kill "$(cat "$pid_file")" >/dev/null 2>&1 || true
-  rm -f "$pid_file"
+  terminate_recorded_process "$mount_name"
   return 1
 }
 
 stop_one() {
   local mount_name="$1"
   local mount_point
-  local pid_file
 
   mount_point="$(mount_point_for "$mount_name")"
-  pid_file="$(pid_file_for "$mount_name")"
 
   if ! mountpoint -q "$mount_point"; then
+    terminate_recorded_process "$mount_name"
     log "$mount_name is not mounted"
-    rm -f "$pid_file"
     return 0
   fi
 
@@ -440,8 +606,8 @@ stop_one() {
   fi
 
   if wait_until_unmounted "$mount_point" "$STOP_TIMEOUT_SECONDS"; then
+    terminate_recorded_process "$mount_name"
     log "Unmounted $mount_name"
-    rm -f "$pid_file"
     return 0
   fi
 
@@ -449,18 +615,127 @@ stop_one() {
   unmount_with_available_tool "$mount_point" lazy || true
 
   if wait_until_unmounted "$mount_point" 5; then
+    terminate_recorded_process "$mount_name"
     log "Lazy-unmounted $mount_name"
-    rm -f "$pid_file"
     return 0
   fi
 
-  if [[ -f "$pid_file" ]]; then
-    log "Sending SIGTERM to recorded rclone pid $(<"$pid_file") for $mount_name"
-    kill "$(cat "$pid_file")" >/dev/null 2>&1 || true
-  fi
+  terminate_recorded_process "$mount_name"
 
   log "Failed to unmount $mount_name from $mount_point"
   return 1
+}
+
+mount_is_healthy() {
+  local mount_name="$1"
+  local mount_point
+  local pid_file
+
+  mount_point="$(mount_point_for "$mount_name")"
+  pid_file="$(pid_file_for "$mount_name")"
+
+  mountpoint -q "$mount_point" || return 1
+  [[ ! -e "$pid_file" ]] || recorded_process_is_running "$mount_name"
+}
+
+mount_failure_reason() {
+  local mount_name="$1"
+  local mount_point
+  local pid_file
+
+  mount_point="$(mount_point_for "$mount_name")"
+  pid_file="$(pid_file_for "$mount_name")"
+
+  if ! mountpoint -q "$mount_point"; then
+    printf 'mount point is no longer active'
+  elif [[ -e "$pid_file" ]] && ! recorded_process_is_running "$mount_name"; then
+    printf 'rclone process exited'
+  else
+    printf 'health check failed'
+  fi
+}
+
+retry_delay_for_failure() {
+  local failure_count="$1"
+  local index=$((failure_count - 1))
+  local last_index=$((${#RETRY_DELAYS_SECONDS[@]} - 1))
+
+  ((index <= last_index)) || index="$last_index"
+  printf '%s\n' "${RETRY_DELAYS_SECONDS[$index]}"
+}
+
+supervise_one_mount() {
+  local mount_name="$1"
+  local failures=0
+  local mounted_since=0
+  local now
+  local retry_delay
+  local next_retry
+  local last_error
+
+  trap - INT TERM HUP
+
+  while true; do
+    write_mount_state "$mount_name" starting "$failures" 0 ""
+
+    if start_one_foreground "$mount_name"; then
+      mounted_since="$(date +%s)"
+      write_mount_state "$mount_name" mounted "$failures" 0 ""
+
+      while mount_is_healthy "$mount_name"; do
+        sleep "$HEALTH_CHECK_INTERVAL_SECONDS"
+      done
+
+      now="$(date +%s)"
+      if ((now - mounted_since >= RETRY_RESET_SECONDS)); then
+        failures=0
+      fi
+
+      last_error="$(mount_failure_reason "$mount_name")"
+      log "$mount_name failed: $last_error; cleaning up only this mount"
+      stop_one "$mount_name" || true
+    else
+      last_error="start attempt failed"
+      log "$mount_name failed to start"
+    fi
+
+    failures=$((failures + 1))
+    retry_delay="$(retry_delay_for_failure "$failures")"
+    next_retry=$(($(date +%s) + retry_delay))
+    write_mount_state "$mount_name" retrying "$failures" "$next_retry" "$last_error"
+    log "$mount_name will retry in ${retry_delay}s (failure $failures)"
+    sleep "$retry_delay"
+  done
+}
+
+start_mount_supervisor() {
+  local mount_name="$1"
+
+  supervise_one_mount "$mount_name" &
+  SUPERVISOR_PIDS[$mount_name]="$!"
+  unset 'SUPERVISOR_RESTART_AT[$mount_name]'
+  log "Started supervisor for $mount_name; pid ${SUPERVISOR_PIDS[$mount_name]}"
+}
+
+shutdown_supervised() {
+  local mount_name
+  local supervisor_pid
+
+  trap - INT TERM HUP
+  log "Termination requested; stopping mount supervisors"
+
+  for mount_name in "${MOUNTS[@]}"; do
+    supervisor_pid="${SUPERVISOR_PIDS[$mount_name]:-}"
+    [[ -z "$supervisor_pid" ]] || kill "$supervisor_pid" >/dev/null 2>&1 || true
+  done
+
+  for mount_name in "${MOUNTS[@]}"; do
+    supervisor_pid="${SUPERVISOR_PIDS[$mount_name]:-}"
+    [[ -z "$supervisor_pid" ]] || wait "$supervisor_pid" 2>/dev/null || true
+  done
+
+  stop_all || true
+  exit 0
 }
 
 start_all_daemon() {
@@ -468,34 +743,25 @@ start_all_daemon() {
   ensure_directories
 
   local mount_name
+  local failures=0
   for mount_name in "${MOUNTS[@]}"; do
     if ! start_one_daemon "$mount_name"; then
       log "Failed to start $mount_name"
+      failures=$((failures + 1))
       if is_true "$ROLLBACK_ON_START_FAILURE"; then
         log "Rolling back already-started mounts"
         stop_started_mounts || true
+        return 1
       fi
-      return 1
     fi
   done
+
+  if ((failures > 0)); then
+    log "$failures configured mount(s) failed; successfully started mounts remain active"
+    return 1
+  fi
 
   log "All configured mounts are started"
-}
-
-start_all_foreground() {
-  ensure_requirements_for_start
-  ensure_directories
-
-  local mount_name
-  for mount_name in "${MOUNTS[@]}"; do
-    if ! start_one_foreground "$mount_name"; then
-      log "Failed to start $mount_name"
-      stop_started_mounts || true
-      return 1
-    fi
-  done
-
-  log "All configured mounts are running under supervision"
 }
 
 stop_all() {
@@ -504,11 +770,15 @@ stop_all() {
 
   local index
   local mount_name
+  local failures=0
 
   for ((index = ${#MOUNTS[@]} - 1; index >= 0; index--)); do
     mount_name="${MOUNTS[$index]}"
-    stop_one "$mount_name"
+    stop_one "$mount_name" || failures=$((failures + 1))
+    write_mount_state "$mount_name" stopped 0 0 ""
   done
+
+  ((failures == 0))
 }
 
 stop_started_mounts() {
@@ -517,11 +787,15 @@ stop_started_mounts() {
 
   local index
   local mount_name
+  local failures=0
 
   for ((index = ${#STARTED_MOUNTS[@]} - 1; index >= 0; index--)); do
     mount_name="${STARTED_MOUNTS[$index]}"
-    stop_one "$mount_name"
+    stop_one "$mount_name" || failures=$((failures + 1))
+    write_mount_state "$mount_name" stopped 0 0 ""
   done
+
+  ((failures == 0))
 }
 
 status_all() {
@@ -532,6 +806,10 @@ status_all() {
   local mount_point
   local pid_file
   local pid_status
+  local state_status
+  local next_retry
+  local last_error
+  local state_details
 
   for mount_name in "${MOUNTS[@]}"; do
     mount_point="$(mount_point_for "$mount_name")"
@@ -545,30 +823,62 @@ status_all() {
     if mountpoint -q "$mount_point"; then
       printf '%-28s mounted     %s%s\n' "$mount_name" "$mount_point" "$pid_status"
     else
-      printf '%-28s not mounted %s%s\n' "$mount_name" "$mount_point" "$pid_status"
+      state_status="$(read_mount_state_field "$mount_name" status 2>/dev/null || true)"
+      next_retry="$(read_mount_state_field "$mount_name" next_retry 2>/dev/null || true)"
+      last_error="$(read_mount_state_field "$mount_name" last_error 2>/dev/null || true)"
+      state_details=""
+
+      case "$state_status" in
+        starting|retrying|failed|stopped) ;;
+        *) state_status="not mounted" ;;
+      esac
+
+      if [[ "$state_status" =~ ^(retrying|failed)$ && "$next_retry" =~ ^[1-9][0-9]*$ ]]; then
+        state_details=" next-retry=$(date -d "@$next_retry" '+%Y-%m-%d %H:%M:%S')"
+      fi
+      [[ -z "$last_error" ]] || state_details="$state_details error=$last_error"
+
+      printf '%-28s %-12s %s%s%s\n' "$mount_name" "$state_status" "$mount_point" "$pid_status" "$state_details"
     fi
   done
 }
 
 run_supervised() {
-  trap 'log "Termination requested"; stop_all; exit 0' INT TERM HUP
+  local mount_name
+  local supervisor_pid
+  local restart_at
+  local now
 
-  start_all_foreground
+  ensure_requirements_for_start
+  ensure_directories
+  trap shutdown_supervised INT TERM HUP
+
+  for mount_name in "${MOUNTS[@]}"; do
+    start_mount_supervisor "$mount_name"
+  done
+  log "All configured mounts have independent supervisors"
 
   while true; do
-    local mount_name
-    local mount_point
+    sleep "$HEALTH_CHECK_INTERVAL_SECONDS"
+    now="$(date +%s)"
 
     for mount_name in "${MOUNTS[@]}"; do
-      mount_point="$(mount_point_for "$mount_name")"
-      if ! mountpoint -q "$mount_point"; then
-        log "$mount_name is no longer mounted; stopping remaining mounts"
-        stop_all || true
-        exit 1
+      supervisor_pid="${SUPERVISOR_PIDS[$mount_name]:-}"
+      if [[ -n "$supervisor_pid" ]] && kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+        continue
+      fi
+
+      restart_at="${SUPERVISOR_RESTART_AT[$mount_name]:-}"
+      if [[ -z "$restart_at" ]]; then
+        [[ -z "$supervisor_pid" ]] || wait "$supervisor_pid" 2>/dev/null || true
+        restart_at=$((now + SUPERVISOR_RESTART_DELAY_SECONDS))
+        SUPERVISOR_RESTART_AT[$mount_name]="$restart_at"
+        write_mount_state "$mount_name" failed 0 "$restart_at" "mount supervisor exited unexpectedly"
+        log "Supervisor for $mount_name exited unexpectedly; restarting it in ${SUPERVISOR_RESTART_DELAY_SECONDS}s"
+      elif ((now >= restart_at)); then
+        start_mount_supervisor "$mount_name"
       fi
     done
-
-    sleep 5
   done
 }
 
@@ -583,6 +893,9 @@ print_config() {
   printf 'CONNECTIVITY_CHECK=%s\n' "$CONNECTIVITY_CHECK"
   printf 'REQUIRE_EMPTY_MOUNTPOINT=%s\n' "$REQUIRE_EMPTY_MOUNTPOINT"
   printf 'ROLLBACK_ON_START_FAILURE=%s\n' "$ROLLBACK_ON_START_FAILURE"
+  printf 'HEALTH_CHECK_INTERVAL_SECONDS=%s\n' "$HEALTH_CHECK_INTERVAL_SECONDS"
+  printf 'RETRY_DELAYS_SECONDS=%s\n' "${RETRY_DELAYS_SECONDS[*]}"
+  printf 'RETRY_RESET_SECONDS=%s\n' "$RETRY_RESET_SECONDS"
   printf 'MOUNTS=%s\n' "${MOUNTS[*]:-}"
 }
 
@@ -626,18 +939,24 @@ doctor() {
 
   ensure_directories
 
-  [[ -w "$ROOT_DIR_PATH" ]] && printf 'ok   root dir writable: %s\n' "$ROOT_DIR_PATH" || {
+  if [[ -w "$ROOT_DIR_PATH" ]]; then
+    printf 'ok   root dir writable: %s\n' "$ROOT_DIR_PATH"
+  else
     printf 'fail root dir not writable: %s\n' "$ROOT_DIR_PATH"
     failures=$((failures + 1))
-  }
-  [[ -w "$LOG_DIR" ]] && printf 'ok   log dir writable: %s\n' "$LOG_DIR" || {
+  fi
+  if [[ -w "$LOG_DIR" ]]; then
+    printf 'ok   log dir writable: %s\n' "$LOG_DIR"
+  else
     printf 'fail log dir not writable: %s\n' "$LOG_DIR"
     failures=$((failures + 1))
-  }
-  [[ -w "$STATE_DIR" ]] && printf 'ok   state dir writable: %s\n' "$STATE_DIR" || {
+  fi
+  if [[ -w "$STATE_DIR" ]]; then
+    printf 'ok   state dir writable: %s\n' "$STATE_DIR"
+  else
     printf 'fail state dir not writable: %s\n' "$STATE_DIR"
     failures=$((failures + 1))
-  }
+  fi
 
   for mount_name in "${MOUNTS[@]}"; do
     mount_point="$(mount_point_for "$mount_name")"
@@ -651,10 +970,12 @@ doctor() {
 
     printf 'ok   %s remote: %s\n' "$mount_name" "$remote"
     mkdir -p "$mount_point"
-    [[ -w "$mount_point" ]] && printf 'ok   %s mount point writable: %s\n' "$mount_name" "$mount_point" || {
+    if [[ -w "$mount_point" ]]; then
+      printf 'ok   %s mount point writable: %s\n' "$mount_name" "$mount_point"
+    else
       printf 'fail %s mount point not writable: %s\n' "$mount_name" "$mount_point"
       failures=$((failures + 1))
-    }
+    fi
   done
 
   if [[ "$MODE" == "system" && " ${DEFAULT_OPTIONS[*]} " == *" --allow-other "* ]]; then

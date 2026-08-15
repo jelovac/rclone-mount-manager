@@ -121,6 +121,7 @@ sudo ./install.sh --system --enable
 sudo ./install.sh --system --start
 ./install.sh --user --dry-run
 ./install.sh --user --force
+./install.sh --user --force --force-config
 ./install.sh --user --no-alias
 ```
 
@@ -128,7 +129,8 @@ Options:
 
 - `--enable` enables the systemd service.
 - `--start` enables and starts the service.
-- `--force` overwrites the binary, unit, and config.
+- `--force` overwrites the binary and unit while keeping the existing config.
+- `--force-config` also overwrites the config and requires `--force`.
 - `--no-alias` skips the `rclone-mount` short command.
 - `--dry-run` prints the planned actions.
 
@@ -139,16 +141,17 @@ Run the installer again after pulling new code.
 User mode:
 
 ```bash
-./install.sh --user --enable
+./install.sh --user --force --enable
 ```
 
 System mode:
 
 ```bash
-sudo ./install.sh --system --enable
+sudo ./install.sh --system --force --enable
 ```
 
-Existing config files are kept unless `--force` is used.
+Existing config files are kept during updates. Add `--force-config` only when
+you explicitly intend to replace the config with the example file.
 
 ## Uninstalling
 
