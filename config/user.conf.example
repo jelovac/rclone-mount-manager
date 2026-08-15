@@ -12,6 +12,7 @@ ROOT_DIR_PATH="$HOME/mnt/rclone"
 
 # Logs and runtime state.
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/rclone-mount-manager/logs"
+PERSISTENT_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/rclone-mount-manager"
 if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
   STATE_DIR="$XDG_RUNTIME_DIR/rclone-mount-manager"
 else

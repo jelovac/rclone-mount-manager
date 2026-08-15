@@ -1,0 +1,23 @@
+.rmm-indicator-warning {
+  color: #f6d32d;
+}
+
+.rmm-indicator-error {
+  color: #ed333b;
+}
+
+.rmm-indicator-stopped {
+  color: #9a9996;
+}
+
+.rmm-mount-warning {
+  color: #f6d32d;
+}
+
+.rmm-mount-error {
+  color: #ed333b;
+}
+
+.rmm-mount-paused {
+  color: #9a9996;
+}

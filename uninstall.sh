@@ -7,6 +7,7 @@ SHORT_NAME="rclone-mount"
 MODE=""
 REMOVE_CONFIG=false
 DRY_RUN=false
+GNOME_EXTENSION_UUID="rclone-mount-manager@jelovac.net"
 
 usage() {
   cat <<EOF
@@ -83,7 +84,7 @@ parse_args() {
       --dry-run)
         DRY_RUN=true
         ;;
-      -h|--help)
+      -h | --help)
         usage
         exit 0
         ;;
@@ -103,9 +104,14 @@ uninstall_user() {
   local alias_path="${HOME}/.local/bin/$SHORT_NAME"
   local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME"
   local unit_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$APP_NAME.service"
+  local extension_dir="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$GNOME_EXTENSION_UUID"
 
   run_optional systemctl --user disable --now "$APP_NAME.service"
+  if [[ -d "$extension_dir" ]] && command -v gnome-extensions >/dev/null 2>&1; then
+    run_optional gnome-extensions disable "$GNOME_EXTENSION_UUID"
+  fi
   run rm -f "$unit_file" "$bin_path"
+  run rm -rf "$extension_dir"
   remove_alias_if_owned "$alias_path" "$bin_path"
   run_optional systemctl --user daemon-reload
 

@@ -173,6 +173,7 @@ User defaults:
 ```bash
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/rclone-mount-manager/logs"
 STATE_DIR="$XDG_RUNTIME_DIR/rclone-mount-manager"
+PERSISTENT_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/rclone-mount-manager"
 ```
 
 If `XDG_RUNTIME_DIR` is empty, user mode falls back to:
@@ -186,6 +187,7 @@ System defaults:
 ```bash
 LOG_DIR="/var/log/rclone-mount-manager"
 STATE_DIR="/run/rclone-mount-manager"
+PERSISTENT_STATE_DIR="/var/lib/rclone-mount-manager"
 ```
 
 Each mount gets a rclone log file:
@@ -193,6 +195,10 @@ Each mount gets a rclone log file:
 ```text
 <LOG_DIR>/<mount-name>-rclone-mount.log
 ```
+
+Runtime status and control requests live under `STATE_DIR` and disappear at
+logout or reboot. Persistent per-mount pause markers live under
+`PERSISTENT_STATE_DIR/paused`. Both control locations are owner-only.
 
 ## Environment Variables
 

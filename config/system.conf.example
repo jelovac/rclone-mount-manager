@@ -13,6 +13,7 @@ ROOT_DIR_PATH="/mnt/rclone"
 # Logs and runtime state.
 LOG_DIR="/var/log/rclone-mount-manager"
 STATE_DIR="/run/rclone-mount-manager"
+PERSISTENT_STATE_DIR="/var/lib/rclone-mount-manager"
 
 # System services normally need an explicit rclone config path.
 # Uncomment and adjust if your system service cannot see the intended remotes.

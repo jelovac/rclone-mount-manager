@@ -1,0 +1,7 @@
+{
+  "uuid": "rclone-mount-manager@jelovac.net",
+  "name": "Rclone Mount Manager",
+  "description": "Monitor and control user rclone mounts from the GNOME top bar.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/jelovac/rclone-mount-manager"
+}

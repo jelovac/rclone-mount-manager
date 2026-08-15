@@ -88,6 +88,16 @@ the manager remains active in a degraded state and continues paced retries.
 Systemd restarts the service only if the manager itself fails, not when an
 individual mount fails.
 
+## Per-Mount Controls
+
+The running manager checks its owner-only control directory on every health
+cycle. A restart or retry request stops only the selected supervisor, cleans up
+that mount, and starts a new supervisor immediately.
+
+A paused mount has no supervisor and is not retried. Pause markers are stored
+outside the runtime directory, so paused mounts remain paused across manager
+and system restarts until explicitly resumed.
+
 ## Stop
 
 On an explicit service stop or shutdown, the manager terminates the independent

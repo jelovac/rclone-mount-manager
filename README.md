@@ -9,6 +9,9 @@ shutdown.
 Each configured mount is supervised independently. A mount failure is cleaned
 up and retried without restarting healthy mounts.
 
+On GNOME desktops, an optional top-bar indicator shows aggregate and per-mount
+health and provides common service and mount actions.
+
 ## Requirements
 
 - Linux with systemd
@@ -86,6 +89,7 @@ rclone-mount print-config
 - [Setup](docs/setup.md)
 - [Configuration](docs/configuration.md)
 - [Commands](docs/commands.md)
+- [GNOME indicator](docs/gnome-extension.md)
 - [Service behavior](docs/service-behavior.md)
 - [Security](docs/security.md)
 - [Troubleshooting](docs/troubleshooting.md)

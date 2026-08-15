@@ -12,6 +12,8 @@ FORCE=false
 FORCE_CONFIG=false
 DRY_RUN=false
 INSTALL_SHORT_ALIAS=true
+GNOME_EXTENSION_MODE=auto
+GNOME_EXTENSION_UUID="rclone-mount-manager@jelovac.net"
 
 usage() {
   cat <<EOF
@@ -26,6 +28,11 @@ Options:
   --force-config
                Also overwrite the existing config. Requires --force.
   --no-alias   Do not install the rclone-mount convenience command.
+  --gnome-extension
+               Install the GNOME Shell indicator for the current user.
+  --no-gnome-extension
+               Do not install the GNOME Shell indicator. By default it is
+               installed for user mode when an active GNOME desktop is detected.
   --dry-run    Print planned actions without writing.
   -h, --help   Show this help.
 EOF
@@ -77,7 +84,7 @@ write_unit() {
   sed \
     -e "s|@BIN_PATH@|$escaped_bin_path|g" \
     -e "s|@CONFIG_FILE@|$escaped_config_file|g" \
-    "$template" > "$target"
+    "$template" >"$target"
 }
 
 install_config() {
@@ -120,6 +127,54 @@ install_short_alias() {
   ln -s "$(basename -- "$bin_path")" "$alias_path"
 }
 
+gnome_extension_supported() {
+  local desktop="${XDG_CURRENT_DESKTOP:-}:${XDG_SESSION_DESKTOP:-}"
+  local shell_version
+
+  [[ "${desktop,,}" == *gnome* ]] || return 1
+  command -v gnome-shell >/dev/null 2>&1 || return 1
+  command -v gnome-extensions >/dev/null 2>&1 || return 1
+
+  shell_version="$(gnome-shell --version 2>/dev/null | awk '{print $3}' | cut -d. -f1)"
+  [[ "$shell_version" =~ ^(45|46|47|48|49|50)$ ]]
+}
+
+should_install_gnome_extension() {
+  [[ "$MODE" == "user" ]] || return 1
+
+  case "$GNOME_EXTENSION_MODE" in
+    yes) return 0 ;;
+    no) return 1 ;;
+    auto) gnome_extension_supported ;;
+  esac
+}
+
+install_gnome_extension() {
+  local source_dir="$PROJECT_DIR/gnome-extension/$GNOME_EXTENSION_UUID"
+  local extension_root="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions"
+  local target_dir="$extension_root/$GNOME_EXTENSION_UUID"
+  local file
+
+  [[ -d "$source_dir" ]] || die "GNOME extension source is missing: $source_dir"
+
+  run mkdir -p "$target_dir"
+  for file in extension.js metadata.json stylesheet.css; do
+    run install -m 0644 "$source_dir/$file" "$target_dir/$file"
+  done
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "dry-run: enable GNOME extension $GNOME_EXTENSION_UUID"
+  elif command -v gnome-extensions >/dev/null 2>&1; then
+    if ! gnome-extensions enable "$GNOME_EXTENSION_UUID" >/dev/null 2>&1; then
+      log "GNOME extension installed. Log out and back in, then enable $GNOME_EXTENSION_UUID."
+    fi
+  else
+    log "GNOME extension installed. Log out and back in, then enable $GNOME_EXTENSION_UUID."
+  fi
+
+  log "GNOME extension: $target_dir"
+}
+
 parse_args() {
   while (($# > 0)); do
     case "$1" in
@@ -145,10 +200,16 @@ parse_args() {
       --no-alias)
         INSTALL_SHORT_ALIAS=false
         ;;
+      --gnome-extension)
+        GNOME_EXTENSION_MODE=yes
+        ;;
+      --no-gnome-extension)
+        GNOME_EXTENSION_MODE=no
+        ;;
       --dry-run)
         DRY_RUN=true
         ;;
-      -h|--help)
+      -h | --help)
         usage
         exit 0
         ;;
@@ -162,6 +223,7 @@ parse_args() {
 
   [[ -n "$MODE" ]] || die "Choose --user or --system."
   [[ "$FORCE_CONFIG" != "true" || "$FORCE" == "true" ]] || die "--force-config requires --force."
+  [[ "$MODE" != "system" || "$GNOME_EXTENSION_MODE" != "yes" ]] || die "--gnome-extension currently supports --user mode only."
 }
 
 install_user() {
@@ -178,10 +240,17 @@ install_user() {
   install_short_alias "$bin_dir" "$bin_path"
   install_config "$PROJECT_DIR/config/user.conf.example" "$config_file" 0600
   write_unit "$PROJECT_DIR/systemd/user/$APP_NAME.service" "$unit_file" "$bin_path" "$config_file"
+  if should_install_gnome_extension; then
+    install_gnome_extension
+  fi
   run systemctl --user daemon-reload
 
   if [[ "$ENABLE_SERVICE" == "true" ]]; then
     run systemctl --user enable "$APP_NAME.service"
+  fi
+
+  if [[ "$FORCE" == "true" ]]; then
+    run systemctl --user try-restart "$APP_NAME.service"
   fi
 
   if [[ "$START_SERVICE" == "true" ]]; then
@@ -218,6 +287,10 @@ install_system() {
 
   if [[ "$ENABLE_SERVICE" == "true" ]]; then
     run systemctl enable "$APP_NAME.service"
+  fi
+
+  if [[ "$FORCE" == "true" ]]; then
+    run systemctl try-restart "$APP_NAME.service"
   fi
 
   if [[ "$START_SERVICE" == "true" ]]; then

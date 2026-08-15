@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="rclone-mount-manager"
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 USER_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME/config"
 SYSTEM_CONFIG_FILE="/etc/$APP_NAME/config"
@@ -12,6 +12,7 @@ MODE="${RMM_MODE:-user}"
 ROOT_DIR_PATH="${RMM_ROOT_DIR_PATH:-}"
 LOG_DIR="${RMM_LOG_DIR:-}"
 STATE_DIR="${RMM_STATE_DIR:-}"
+PERSISTENT_STATE_DIR="${RMM_PERSISTENT_STATE_DIR:-}"
 START_TIMEOUT_SECONDS="${RMM_START_TIMEOUT_SECONDS:-20}"
 STOP_TIMEOUT_SECONDS="${RMM_STOP_TIMEOUT_SECONDS:-20}"
 CONNECTIVITY_CHECK="${RMM_CONNECTIVITY_CHECK:-remote}"
@@ -65,7 +66,11 @@ Commands:
   start          Mount configured remotes using rclone --daemon.
   stop           Gracefully unmount configured remotes.
   restart        Stop and start configured remotes.
-  status         Show configured mount status.
+  status [--json]
+                 Show configured mount status.
+  mount ACTION NAME
+                 Control one supervised mount. ACTION is pause, resume,
+                 restart, or retry.
   run            Foreground supervised mode for systemd.
   doctor         Check dependencies, config, remotes, and mount paths.
   print-config   Print resolved runtime settings.
@@ -80,7 +85,7 @@ EOF
 
 is_true() {
   case "${1,,}" in
-    1|yes|true|on) return 0 ;;
+    1 | yes | true | on) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -120,7 +125,7 @@ select_config_file() {
 
 apply_runtime_defaults() {
   case "$MODE" in
-    user|system) ;;
+    user | system) ;;
     *) die "MODE must be either 'user' or 'system'; got '$MODE'" ;;
   esac
 
@@ -147,6 +152,14 @@ apply_runtime_defaults() {
       STATE_DIR="$XDG_RUNTIME_DIR/$APP_NAME"
     else
       STATE_DIR="/tmp/$APP_NAME-$(id -u)"
+    fi
+  fi
+
+  if [[ -z "$PERSISTENT_STATE_DIR" ]]; then
+    if [[ "$MODE" == "system" ]]; then
+      PERSISTENT_STATE_DIR="/var/lib/$APP_NAME"
+    else
+      PERSISTENT_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$APP_NAME"
     fi
   fi
 }
@@ -218,8 +231,28 @@ ensure_requirements_for_start() {
 }
 
 ensure_directories() {
-  mkdir -p "$ROOT_DIR_PATH" "$LOG_DIR"
+  mkdir -p "$ROOT_DIR_PATH" "$LOG_DIR" "$PERSISTENT_STATE_DIR/paused"
   ensure_state_directory
+  ensure_private_directory "$PERSISTENT_STATE_DIR/paused"
+  mkdir -p "$STATE_DIR/control"
+  ensure_private_directory "$STATE_DIR/control"
+}
+
+ensure_private_directory() {
+  local directory="$1"
+  local current_uid
+  local directory_owner
+  local directory_mode
+
+  current_uid="$(id -u)"
+  directory_owner="$(stat -c '%u' "$directory")"
+  directory_mode="$(stat -c '%a' "$directory")"
+
+  [[ "$directory_owner" == "$current_uid" ]] || die "Directory is not owned by current user: $directory"
+
+  if ((8#$directory_mode & 8#077)); then
+    chmod 0700 "$directory"
+  fi
 }
 
 ensure_state_directory() {
@@ -240,7 +273,7 @@ ensure_state_directory() {
 
   [[ "$state_owner" == "$current_uid" ]] || die "State dir is not owned by current user: $STATE_DIR"
 
-  if (( 8#$state_mode & 8#077 )); then
+  if ((8#$state_mode & 8#077)); then
     chmod 0700 "$STATE_DIR"
   fi
 }
@@ -265,6 +298,32 @@ status_file_for() {
   printf '%s/%s.status\n' "$STATE_DIR" "$mount_name"
 }
 
+pause_file_for() {
+  local mount_name="$1"
+  printf '%s/paused/%s\n' "$PERSISTENT_STATE_DIR" "$mount_name"
+}
+
+control_file_for() {
+  local mount_name="$1"
+  printf '%s/control/%s.command\n' "$STATE_DIR" "$mount_name"
+}
+
+mount_is_paused() {
+  local mount_name="$1"
+  [[ -f "$(pause_file_for "$mount_name")" ]]
+}
+
+mount_is_configured() {
+  local requested_name="$1"
+  local mount_name
+
+  for mount_name in "${MOUNTS[@]}"; do
+    [[ "$mount_name" == "$requested_name" ]] && return 0
+  done
+
+  return 1
+}
+
 write_mount_state() {
   local mount_name="$1"
   local status="$2"
@@ -283,7 +342,7 @@ write_mount_state() {
     printf 'failures=%s\n' "$failures"
     printf 'next_retry=%s\n' "$next_retry"
     printf 'last_error=%s\n' "$last_error"
-  } > "$temporary_file"
+  } >"$temporary_file"
   mv -f "$temporary_file" "$status_file"
 }
 
@@ -302,9 +361,75 @@ read_mount_state_field() {
       printf '%s\n' "$value"
       return 0
     fi
-  done < "$status_file"
+  done <"$status_file"
 
   return 1
+}
+
+json_quote() {
+  local value="$1"
+  local character
+  local escaped=""
+  local code
+  local index
+  local LC_ALL=C
+
+  for ((index = 0; index < ${#value}; index++)); do
+    character="${value:index:1}"
+    case "$character" in
+      '"') escaped+='\"' ;;
+      \\) escaped="${escaped}\\\\" ;;
+      $'\b') escaped+='\b' ;;
+      $'\f') escaped+='\f' ;;
+      $'\n') escaped+='\n' ;;
+      $'\r') escaped+='\r' ;;
+      $'\t') escaped+='\t' ;;
+      *)
+        printf -v code '%d' "'$character"
+        if ((code < 32)); then
+          printf -v escaped '%s\\u%04x' "$escaped" "$code"
+        else
+          escaped+="$character"
+        fi
+        ;;
+    esac
+  done
+
+  printf '"%s"' "$escaped"
+}
+
+normalized_mount_status() {
+  local mount_name="$1"
+  local mounted="${2:-}"
+  local mount_point
+  local state_status
+
+  mount_point="$(mount_point_for "$mount_name")"
+
+  if [[ -z "$mounted" ]]; then
+    mounted=false
+    mountpoint -q "$mount_point" && mounted=true
+  fi
+
+  if [[ "$mounted" == "true" ]]; then
+    if mount_is_paused "$mount_name"; then
+      printf 'pausing\n'
+    else
+      printf 'mounted\n'
+    fi
+    return 0
+  fi
+
+  if mount_is_paused "$mount_name"; then
+    printf 'paused\n'
+    return 0
+  fi
+
+  state_status="$(read_mount_state_field "$mount_name" status 2>/dev/null || true)"
+  case "$state_status" in
+    starting | retrying | failed | stopped | pausing) printf '%s\n' "$state_status" ;;
+    *) printf 'not-mounted\n' ;;
+  esac
 }
 
 directory_has_entries() {
@@ -349,7 +474,7 @@ recorded_process_matches_mount() {
   while IFS= read -r -d '' argument; do
     [[ "$argument" == "$remote" ]] && found_remote=true
     [[ "$argument" == "$mount_point" ]] && found_mount_point=true
-  done < "/proc/$pid/cmdline"
+  done <"/proc/$pid/cmdline"
 
   [[ "$found_remote" == "true" && "$found_mount_point" == "true" ]]
 }
@@ -575,7 +700,7 @@ start_one_foreground() {
     --log-level INFO &
 
   pid="$!"
-  printf '%s\n' "$pid" > "$pid_file"
+  printf '%s\n' "$pid" >"$pid_file"
 
   if wait_until_mounted "$mount_point" "$START_TIMEOUT_SECONDS" "$pid"; then
     log "Mounted $mount_name at $mount_point; rclone pid $pid"
@@ -717,21 +842,125 @@ start_mount_supervisor() {
   log "Started supervisor for $mount_name; pid ${SUPERVISOR_PIDS[$mount_name]}"
 }
 
+stop_mount_supervisor() {
+  local mount_name="$1"
+  local supervisor_pid="${SUPERVISOR_PIDS[$mount_name]:-}"
+
+  if [[ -n "$supervisor_pid" ]]; then
+    if kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+      kill -TERM "$supervisor_pid" >/dev/null 2>&1 || true
+    fi
+    wait "$supervisor_pid" 2>/dev/null || true
+  fi
+
+  unset 'SUPERVISOR_PIDS[$mount_name]'
+  unset 'SUPERVISOR_RESTART_AT[$mount_name]'
+}
+
+restart_mount_supervisor() {
+  local mount_name="$1"
+
+  log "Restart requested for $mount_name"
+  stop_mount_supervisor "$mount_name"
+  stop_one "$mount_name" || true
+  start_mount_supervisor "$mount_name"
+}
+
+set_mount_paused() {
+  local mount_name="$1"
+  local paused="$2"
+  local pause_file
+  local temporary_file
+
+  pause_file="$(pause_file_for "$mount_name")"
+  if [[ "$paused" == "true" ]]; then
+    temporary_file="$pause_file.tmp.$BASHPID"
+    printf '%s\n' "$mount_name" >"$temporary_file"
+    mv -f "$temporary_file" "$pause_file"
+  else
+    rm -f "$pause_file"
+  fi
+}
+
+queue_mount_control() {
+  local mount_name="$1"
+  local action="$2"
+  local control_file
+  local temporary_file
+
+  control_file="$(control_file_for "$mount_name")"
+  temporary_file="$control_file.tmp.$BASHPID"
+  printf '%s\n' "$action" >"$temporary_file"
+  mv -f "$temporary_file" "$control_file"
+}
+
+request_mount_control() {
+  local action="$1"
+  local mount_name="$2"
+
+  mount_is_configured "$mount_name" || die "Unknown mount: $mount_name"
+  ensure_directories
+
+  case "$action" in
+    pause)
+      set_mount_paused "$mount_name" true
+      write_mount_state "$mount_name" pausing 0 0 ""
+      ;;
+    resume)
+      set_mount_paused "$mount_name" false
+      ;;
+    restart | retry)
+      mount_is_paused "$mount_name" && die "$mount_name is paused; resume it first."
+      ;;
+    *) die "Unsupported mount action: $action. Use pause, resume, restart, or retry." ;;
+  esac
+
+  queue_mount_control "$mount_name" "$action"
+  printf 'Requested %s for %s.\n' "$action" "$mount_name"
+}
+
+process_mount_control() {
+  local mount_name="$1"
+  local control_file
+  local action
+
+  control_file="$(control_file_for "$mount_name")"
+  [[ -r "$control_file" ]] || return 1
+  action="$(<"$control_file")"
+  rm -f "$control_file"
+
+  case "$action" in
+    pause)
+      log "Pause requested for $mount_name"
+      stop_mount_supervisor "$mount_name"
+      stop_one "$mount_name" || true
+      write_mount_state "$mount_name" paused 0 0 ""
+      ;;
+    resume)
+      log "Resume requested for $mount_name"
+      if [[ -z "${SUPERVISOR_PIDS[$mount_name]:-}" ]]; then
+        start_mount_supervisor "$mount_name"
+      fi
+      ;;
+    restart | retry)
+      restart_mount_supervisor "$mount_name"
+      ;;
+    *)
+      log "Ignoring unknown control request '$action' for $mount_name"
+      ;;
+  esac
+
+  return 0
+}
+
 shutdown_supervised() {
   local mount_name
-  local supervisor_pid
 
   trap - INT TERM HUP
   log "Termination requested; stopping mount supervisors"
 
   for mount_name in "${MOUNTS[@]}"; do
-    supervisor_pid="${SUPERVISOR_PIDS[$mount_name]:-}"
-    [[ -z "$supervisor_pid" ]] || kill "$supervisor_pid" >/dev/null 2>&1 || true
-  done
-
-  for mount_name in "${MOUNTS[@]}"; do
-    supervisor_pid="${SUPERVISOR_PIDS[$mount_name]:-}"
-    [[ -z "$supervisor_pid" ]] || wait "$supervisor_pid" 2>/dev/null || true
+    stop_mount_supervisor "$mount_name"
   done
 
   stop_all || true
@@ -820,16 +1049,17 @@ status_all() {
       pid_status=" pid=$(<"$pid_file")"
     fi
 
-    if mountpoint -q "$mount_point"; then
+    state_status="$(normalized_mount_status "$mount_name")"
+
+    if [[ "$state_status" == "mounted" ]]; then
       printf '%-28s mounted     %s%s\n' "$mount_name" "$mount_point" "$pid_status"
     else
-      state_status="$(read_mount_state_field "$mount_name" status 2>/dev/null || true)"
       next_retry="$(read_mount_state_field "$mount_name" next_retry 2>/dev/null || true)"
       last_error="$(read_mount_state_field "$mount_name" last_error 2>/dev/null || true)"
       state_details=""
 
       case "$state_status" in
-        starting|retrying|failed|stopped) ;;
+        starting | retrying | failed | stopped | paused | pausing) ;;
         *) state_status="not mounted" ;;
       esac
 
@@ -843,6 +1073,62 @@ status_all() {
   done
 }
 
+status_json() {
+  require_command mountpoint
+  ensure_directories
+
+  local mount_name
+  local mount_point
+  local log_file
+  local state_status
+  local failures
+  local next_retry
+  local last_error
+  local mounted
+  local paused
+  local separator=""
+
+  printf '{'
+  printf '"version":%s,' "$(json_quote "$VERSION")"
+  printf '"mode":%s,' "$(json_quote "$MODE")"
+  printf '"config_file":%s,' "$(json_quote "${CONFIG_FILE:-}")"
+  printf '"log_dir":%s,' "$(json_quote "$LOG_DIR")"
+  printf '"state_dir":%s,' "$(json_quote "$STATE_DIR")"
+  printf '"persistent_state_dir":%s,' "$(json_quote "$PERSISTENT_STATE_DIR")"
+  printf '"mounts":['
+
+  for mount_name in "${MOUNTS[@]}"; do
+    mount_point="$(mount_point_for "$mount_name")"
+    log_file="$(log_file_for "$mount_name")"
+    mounted=false
+    mountpoint -q "$mount_point" && mounted=true
+    state_status="$(normalized_mount_status "$mount_name" "$mounted")"
+    failures="$(read_mount_state_field "$mount_name" failures 2>/dev/null || true)"
+    next_retry="$(read_mount_state_field "$mount_name" next_retry 2>/dev/null || true)"
+    last_error="$(read_mount_state_field "$mount_name" last_error 2>/dev/null || true)"
+    [[ "$failures" =~ ^[0-9]+$ ]] || failures=0
+    [[ "$next_retry" =~ ^[0-9]+$ ]] || next_retry=0
+
+    paused=false
+    mount_is_paused "$mount_name" && paused=true
+
+    printf '%s{' "$separator"
+    printf '"name":%s,' "$(json_quote "$mount_name")"
+    printf '"status":%s,' "$(json_quote "$state_status")"
+    printf '"mounted":%s,' "$mounted"
+    printf '"paused":%s,' "$paused"
+    printf '"mount_point":%s,' "$(json_quote "$mount_point")"
+    printf '"log_file":%s,' "$(json_quote "$log_file")"
+    printf '"failures":%s,' "$failures"
+    printf '"next_retry":%s,' "$next_retry"
+    printf '"last_error":%s' "$(json_quote "$last_error")"
+    printf '}'
+    separator=,
+  done
+
+  printf ']}\n'
+}
+
 run_supervised() {
   local mount_name
   local supervisor_pid
@@ -854,7 +1140,13 @@ run_supervised() {
   trap shutdown_supervised INT TERM HUP
 
   for mount_name in "${MOUNTS[@]}"; do
-    start_mount_supervisor "$mount_name"
+    rm -f "$(control_file_for "$mount_name")"
+    if mount_is_paused "$mount_name"; then
+      write_mount_state "$mount_name" paused 0 0 ""
+      log "$mount_name is paused; not starting its supervisor"
+    else
+      start_mount_supervisor "$mount_name"
+    fi
   done
   log "All configured mounts have independent supervisors"
 
@@ -863,6 +1155,19 @@ run_supervised() {
     now="$(date +%s)"
 
     for mount_name in "${MOUNTS[@]}"; do
+      if process_mount_control "$mount_name"; then
+        continue
+      fi
+
+      if mount_is_paused "$mount_name"; then
+        if [[ -n "${SUPERVISOR_PIDS[$mount_name]:-}" ]]; then
+          stop_mount_supervisor "$mount_name"
+          stop_one "$mount_name" || true
+        fi
+        write_mount_state "$mount_name" paused 0 0 ""
+        continue
+      fi
+
       supervisor_pid="${SUPERVISOR_PIDS[$mount_name]:-}"
       if [[ -n "$supervisor_pid" ]] && kill -0 "$supervisor_pid" >/dev/null 2>&1; then
         continue
@@ -890,6 +1195,7 @@ print_config() {
   printf 'ROOT_DIR_PATH=%s\n' "$ROOT_DIR_PATH"
   printf 'LOG_DIR=%s\n' "$LOG_DIR"
   printf 'STATE_DIR=%s\n' "$STATE_DIR"
+  printf 'PERSISTENT_STATE_DIR=%s\n' "$PERSISTENT_STATE_DIR"
   printf 'CONNECTIVITY_CHECK=%s\n' "$CONNECTIVITY_CHECK"
   printf 'REQUIRE_EMPTY_MOUNTPOINT=%s\n' "$REQUIRE_EMPTY_MOUNTPOINT"
   printf 'ROLLBACK_ON_START_FAILURE=%s\n' "$ROLLBACK_ON_START_FAILURE"
@@ -994,9 +1300,11 @@ doctor() {
 
 main() {
   local command="${1:-help}"
+  local subcommand="${2:-}"
+  local mount_name="${3:-}"
 
   case "$command" in
-    help|--help|-h)
+    help | --help | -h)
       usage
       ;;
     start)
@@ -1018,7 +1326,18 @@ main() {
     status)
       load_config
       validate_config
-      status_all
+      case "$subcommand" in
+        "") status_all ;;
+        --json) status_json ;;
+        *) die "Unsupported status option: $subcommand" ;;
+      esac
+      ;;
+    mount)
+      [[ -n "$subcommand" && -n "$mount_name" ]] || die "Usage: $APP_NAME mount ACTION NAME"
+      (($# == 3)) || die "Usage: $APP_NAME mount ACTION NAME"
+      load_config
+      validate_config
+      request_mount_control "$subcommand" "$mount_name"
       ;;
     run)
       load_config

@@ -123,6 +123,8 @@ sudo ./install.sh --system --start
 ./install.sh --user --force
 ./install.sh --user --force --force-config
 ./install.sh --user --no-alias
+./install.sh --user --gnome-extension
+./install.sh --user --no-gnome-extension
 ```
 
 Options:
@@ -130,9 +132,18 @@ Options:
 - `--enable` enables the systemd service.
 - `--start` enables and starts the service.
 - `--force` overwrites the binary and unit while keeping the existing config.
+  If the service is currently active, it is restarted so the updated manager
+  code takes effect immediately.
 - `--force-config` also overwrites the config and requires `--force`.
 - `--no-alias` skips the `rclone-mount` short command.
+- `--gnome-extension` installs the GNOME top-bar indicator for the current user.
+- `--no-gnome-extension` skips it. Without either option, user-mode installation
+  includes it when a supported active GNOME desktop is detected.
 - `--dry-run` prints the planned actions.
+
+The GNOME extension currently controls user-mode services only. A newly
+installed extension may require logging out and back in before GNOME Shell can
+enable it. See [GNOME indicator](gnome-extension.md).
 
 ## Updating
 
