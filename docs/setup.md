@@ -24,6 +24,11 @@ Install:
 ./install.sh --user --enable
 ```
 
+Run user-mode installation as your normal desktop user, not with `sudo`. If the
+GNOME extension target is not writable, the installer asks before using `sudo`
+to copy only its own extension directory and files. The copied content is owned
+by the desktop user.
+
 Edit the config:
 
 ```bash
@@ -163,6 +168,12 @@ sudo ./install.sh --system --force --enable
 
 Existing config files are kept during updates. Add `--force-config` only when
 you explicitly intend to replace the config with the example file.
+
+Do not prefix the user-mode update with `sudo`. The installer rejects privileged
+`--user` runs so they cannot leave root-owned files in your home directory. It
+may prompt later for an extension-only privileged copy. Declining stops the
+installation before any files are changed; `--no-gnome-extension` skips that
+segment entirely.
 
 ## Uninstalling
 

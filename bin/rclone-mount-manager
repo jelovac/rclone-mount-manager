@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="rclone-mount-manager"
-VERSION="0.3.0"
+VERSION="0.3.1"
 
 USER_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME/config"
 SYSTEM_CONFIG_FILE="/etc/$APP_NAME/config"
@@ -72,7 +72,8 @@ Commands:
                  Control one supervised mount. ACTION is pause, resume,
                  restart, or retry.
   run            Foreground supervised mode for systemd.
-  doctor         Check dependencies, config, remotes, and mount paths.
+  doctor [--wait]
+                 Check dependencies, config, remotes, and mount paths.
   print-config   Print resolved runtime settings.
   help           Show this help.
 
@@ -1302,6 +1303,7 @@ main() {
   local command="${1:-help}"
   local subcommand="${2:-}"
   local mount_name="${3:-}"
+  local doctor_status=0
 
   case "$command" in
     help | --help | -h)
@@ -1345,8 +1347,19 @@ main() {
       run_supervised
       ;;
     doctor)
+      case "$subcommand" in
+        "" | --wait) ;;
+        *) die "Unsupported doctor option: $subcommand" ;;
+      esac
+      (($# <= 2)) || die "Usage: $APP_NAME doctor [--wait]"
       load_config
-      doctor
+      doctor || doctor_status=$?
+      if [[ "$subcommand" == "--wait" ]]; then
+        printf '\nPress Enter to close diagnostics...'
+        IFS= read -r _ || true
+        printf '\n'
+      fi
+      return "$doctor_status"
       ;;
     print-config)
       load_config

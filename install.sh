@@ -14,6 +14,7 @@ DRY_RUN=false
 INSTALL_SHORT_ALIAS=true
 GNOME_EXTENSION_MODE=auto
 GNOME_EXTENSION_UUID="rclone-mount-manager@jelovac.net"
+GNOME_EXTENSION_USE_SUDO=false
 
 usage() {
   cat <<EOF
@@ -54,6 +55,109 @@ run() {
     printf '\n'
   else
     "$@"
+  fi
+}
+
+validate_install_context() {
+  local effective_uid="$1"
+
+  if [[ "$MODE" == "user" && "$effective_uid" == "0" && "$DRY_RUN" != "true" ]]; then
+    die "--user must be run as the desktop user, without sudo. Use --system for a root-managed installation."
+  fi
+}
+
+extension_target_dir() {
+  printf '%s/gnome-shell/extensions/%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}" "$GNOME_EXTENSION_UUID"
+}
+
+can_write_extension_target() {
+  local target_dir="$1"
+  local existing="$target_dir"
+
+  if [[ -d "$target_dir" ]]; then
+    [[ -w "$target_dir" && -x "$target_dir" ]]
+    return
+  fi
+
+  [[ ! -e "$target_dir" && ! -L "$target_dir" ]] || return 1
+
+  while [[ ! -e "$existing" && ! -L "$existing" ]]; do
+    [[ "$existing" != "/" ]] || return 1
+    existing="$(dirname -- "$existing")"
+  done
+
+  [[ -d "$existing" && -w "$existing" && -x "$existing" ]]
+}
+
+confirm_privileged_extension_install() {
+  local target_dir="$1"
+  local response
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "dry-run: $target_dir is not writable; would ask to install the GNOME extension with sudo"
+    return 0
+  fi
+
+  [[ -t 0 ]] || die "GNOME extension target is not writable: $target_dir. Rerun interactively to approve a privileged extension-only copy, or use --no-gnome-extension."
+
+  printf 'GNOME extension target is not writable: %s\n' "$target_dir"
+  if ! IFS= read -r -p "Install only the GNOME extension files with sudo? [y/N] " response; then
+    die "GNOME extension installation cancelled before any files were changed."
+  fi
+
+  case "${response,,}" in
+    y | yes) return 0 ;;
+    *) die "GNOME extension installation cancelled before any files were changed." ;;
+  esac
+}
+
+prepare_gnome_extension_install() {
+  local target_dir
+  local extension_root
+
+  should_install_gnome_extension || return 0
+  target_dir="$(extension_target_dir)"
+  extension_root="$(dirname -- "$target_dir")"
+
+  if [[ (-e "$target_dir" || -L "$target_dir") && ! -d "$target_dir" ]]; then
+    die "GNOME extension target does not resolve to a directory: $target_dir"
+  fi
+  can_write_extension_target "$target_dir" && return 0
+  [[ -d "$extension_root" ]] || die "GNOME extensions directory cannot be created without modifying its parent: $extension_root"
+
+  confirm_privileged_extension_install "$target_dir"
+  GNOME_EXTENSION_USE_SUDO=true
+}
+
+run_privileged_extension_install() {
+  local source_dir="$1"
+  local target_dir="$2"
+  local sudo_bin
+  local install_bin
+  local group_id
+  local file
+  local extension_root
+
+  sudo_bin="$(command -v sudo)" || die "sudo is unavailable; cannot perform the approved GNOME extension copy."
+  install_bin="$(command -v install)" || die "install is unavailable; cannot copy the GNOME extension."
+  group_id="$(id -g)"
+  extension_root="$(dirname -- "$target_dir")"
+  [[ -d "$extension_root" ]] || die "Refusing to modify the parent of the GNOME extensions directory: $extension_root"
+
+  if [[ ! -L "$target_dir" ]]; then
+    run "$sudo_bin" "$install_bin" -d -o "$EUID" -g "$group_id" -m 0755 "$target_dir"
+  fi
+  for file in extension.js metadata.json stylesheet.css; do
+    run "$sudo_bin" "$install_bin" -o "$EUID" -g "$group_id" -m 0644 "$source_dir/$file" "$target_dir/$file"
+  done
+
+  if [[ "$DRY_RUN" != "true" ]]; then
+    if [[ ! -L "$target_dir" && "$(stat -c '%u' -- "$target_dir")" != "$EUID" ]]; then
+      die "Privileged copy completed, but the extension directory has the wrong owner: $target_dir"
+    fi
+    for file in extension.js metadata.json stylesheet.css; do
+      [[ "$(stat -c '%u' -- "$target_dir/$file")" == "$EUID" ]] || die "Privileged copy completed, but $target_dir/$file has the wrong owner."
+    done
   fi
 }
 
@@ -157,10 +261,14 @@ install_gnome_extension() {
 
   [[ -d "$source_dir" ]] || die "GNOME extension source is missing: $source_dir"
 
-  run mkdir -p "$target_dir"
-  for file in extension.js metadata.json stylesheet.css; do
-    run install -m 0644 "$source_dir/$file" "$target_dir/$file"
-  done
+  if [[ "$GNOME_EXTENSION_USE_SUDO" == "true" ]]; then
+    run_privileged_extension_install "$source_dir" "$target_dir"
+  else
+    run mkdir -p "$target_dir"
+    for file in extension.js metadata.json stylesheet.css; do
+      run install -m 0644 "$source_dir/$file" "$target_dir/$file"
+    done
+  fi
 
   if [[ "$DRY_RUN" == "true" ]]; then
     log "dry-run: enable GNOME extension $GNOME_EXTENSION_UUID"
@@ -234,6 +342,7 @@ install_user() {
   local config_file="$config_dir/config"
   local unit_file="$systemd_dir/$APP_NAME.service"
 
+  prepare_gnome_extension_install
   run mkdir -p "$bin_dir" "$config_dir" "$systemd_dir"
   run chmod 0700 "$config_dir"
   run install -m 0755 "$PROJECT_DIR/bin/$APP_NAME" "$bin_path"
@@ -307,6 +416,7 @@ install_system() {
 
 main() {
   parse_args "$@"
+  validate_install_context "$EUID"
 
   case "$MODE" in
     user) install_user ;;
@@ -314,4 +424,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

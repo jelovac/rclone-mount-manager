@@ -21,6 +21,12 @@ Override detection explicitly:
 ./install.sh --user --enable --no-gnome-extension
 ```
 
+Run these commands without `sudo`. If the extension target is not writable, the
+installer asks whether it may use `sudo` for an extension-only copy. It does not
+change the surrounding GNOME extensions directory; only this extension's
+directory and three files are installed, with ownership assigned to the desktop
+user. Declining stops before any installation files are changed.
+
 The extension is installed under:
 
 ```text

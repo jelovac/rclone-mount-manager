@@ -88,6 +88,10 @@ Run checks:
 rclone-mount doctor
 ```
 
+Use `doctor --wait` when launching diagnostics in a temporary terminal. It
+keeps the results visible until Enter is pressed. The GNOME indicator uses this
+mode for its **Run Diagnostics** action.
+
 Print resolved settings:
 
 ```bash

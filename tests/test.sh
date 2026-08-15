@@ -86,6 +86,34 @@ test_help() {
   assert_contains "$output" "doctor"
 }
 
+test_gnome_indicator_registers_gobject_type() {
+  local extension_file="$PROJECT_DIR/gnome-extension/rclone-mount-manager@jelovac.net/extension.js"
+  local source
+
+  source="$(<"$extension_file")"
+  assert_contains "$source" "import GObject from 'gi://GObject';"
+  assert_contains "$source" "const RcloneIndicator = GObject.registerClass("
+  assert_contains "$source" "const [stdout, stderr] = await process.communicate_utf8_async"
+  assert_not_contains "$source" "const [, stdout, stderr]"
+  assert_contains "$source" "text: 'RMM'"
+  assert_contains "$source" "[this.binary, 'doctor', '--wait']"
+}
+
+test_doctor_waits_for_confirmation() {
+  local temp_dir
+  local config_file
+  local output
+
+  temp_dir="$(mktemp -d)"
+  config_file="$(make_temp_config "$temp_dir")"
+  output="$(printf '\n' | RMM_CONFIG_FILE="$config_file" "$BIN" doctor --wait 2>&1 || true)"
+
+  assert_contains "$output" "Checks:"
+  assert_contains "$output" "Press Enter to close diagnostics"
+
+  rm -rf "$temp_dir"
+}
+
 test_print_config_with_temp_config() {
   local temp_dir
   local config_file
@@ -220,6 +248,146 @@ EOF
 
   HOME="$home_dir" XDG_CURRENT_DESKTOP='' XDG_SESSION_DESKTOP='' RMM_SYSTEMCTL_CALLS="$temp_dir/systemctl-calls" PATH="$mock_bin:/usr/bin:/bin" "$PROJECT_DIR/install.sh" --user --force --force-config --no-alias >/dev/null
   assert_contains "$(<"$config_file")" "MODE=user"
+
+  rm -rf "$temp_dir"
+}
+
+test_user_install_rejects_sudo() {
+  local output
+
+  if output="$(bash -c '
+    source "$1"
+    MODE=user
+    DRY_RUN=false
+    validate_install_context 0
+  ' bash "$PROJECT_DIR/install.sh" 2>&1)"; then
+    fail "user install should reject sudo/root execution"
+  fi
+  assert_contains "$output" "without sudo"
+}
+
+test_unwritable_extension_stops_before_installation_non_interactively() {
+  local temp_dir
+  local home_dir
+  local extension_root
+  local output
+
+  temp_dir="$(mktemp -d)"
+  home_dir="$temp_dir/home"
+  extension_root="$home_dir/.local/share/gnome-shell/extensions"
+  mkdir -p "$extension_root"
+  chmod 0555 "$extension_root"
+
+  if output="$(HOME="$home_dir" PATH="/usr/bin:/bin" "$PROJECT_DIR/install.sh" --user --force --no-alias --gnome-extension </dev/null 2>&1)"; then
+    fail "non-interactive installation should stop when extension-only sudo approval is required"
+  fi
+  assert_contains "$output" "privileged extension-only copy"
+  [[ ! -e "$home_dir/.local/bin/rclone-mount-manager" ]] || fail "installation changed files before privileged-copy approval"
+
+  chmod u+w "$extension_root"
+  rm -rf "$temp_dir"
+}
+
+test_privileged_extension_copy_is_scoped_and_user_owned() {
+  local temp_dir
+  local mock_bin
+  local extension_root
+  local target_dir
+  local calls
+  local file
+
+  temp_dir="$(mktemp -d)"
+  mock_bin="$temp_dir/bin"
+  extension_root="$temp_dir/extensions"
+  target_dir="$extension_root/rclone-mount-manager@jelovac.net"
+  mkdir -p "$mock_bin" "$extension_root"
+  chmod 0555 "$extension_root"
+
+  cat >"$mock_bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+printf '%q ' "$@" >>"$RMM_SUDO_CALLS"
+printf '\n' >>"$RMM_SUDO_CALLS"
+chmod u+w "$RMM_EXTENSION_ROOT"
+"$@"
+EOF
+  chmod +x "$mock_bin/sudo"
+
+  PATH="$mock_bin:/usr/bin:/bin" RMM_SUDO_CALLS="$temp_dir/sudo-calls" RMM_EXTENSION_ROOT="$extension_root" bash -c '
+    source "$1"
+    DRY_RUN=false
+    run_privileged_extension_install "$2" "$3"
+  ' bash "$PROJECT_DIR/install.sh" "$PROJECT_DIR/gnome-extension/rclone-mount-manager@jelovac.net" "$target_dir"
+
+  calls="$(<"$temp_dir/sudo-calls")"
+  assert_not_contains "$calls" "chown"
+  assert_contains "$calls" "$target_dir"
+  [[ "$(wc -l <"$temp_dir/sudo-calls")" == "4" ]] || fail "privileged extension copy issued unexpected commands"
+  [[ "$(stat -c '%u' -- "$target_dir")" == "$EUID" ]] || fail "extension directory is not owned by the current user"
+  for file in extension.js metadata.json stylesheet.css; do
+    [[ "$(stat -c '%u' -- "$target_dir/$file")" == "$EUID" ]] || fail "$file is not owned by the current user"
+  done
+
+  chmod u+w "$extension_root"
+  rm -rf "$temp_dir"
+}
+
+test_privileged_extension_copy_is_visible_in_dry_run() {
+  local temp_dir
+  local home_dir
+  local extension_root
+  local target_dir
+  local output
+
+  temp_dir="$(mktemp -d)"
+  home_dir="$temp_dir/home"
+  extension_root="$home_dir/.local/share/gnome-shell/extensions"
+  target_dir="$extension_root/rclone-mount-manager@jelovac.net"
+  mkdir -p "$extension_root"
+
+  output="$(bash -c '
+    source "$1"
+    can_write_extension_target() {
+      return 1
+    }
+    HOME="$2"
+    main --user --force --no-alias --gnome-extension --dry-run
+  ' bash "$PROJECT_DIR/install.sh" "$home_dir")"
+  assert_contains "$output" "would ask to install the GNOME extension with sudo"
+  assert_contains "$output" "$target_dir"
+  assert_contains "$output" "sudo"
+  assert_not_contains "$output" "chown"
+
+  rm -rf "$temp_dir"
+}
+
+test_extension_target_directory_symlink_is_supported() {
+  local temp_dir
+  local home_dir
+  local mock_bin
+  local extension_root
+  local external_target
+
+  temp_dir="$(mktemp -d)"
+  home_dir="$temp_dir/home"
+  mock_bin="$temp_dir/bin"
+  extension_root="$home_dir/.local/share/gnome-shell/extensions"
+  external_target="$temp_dir/external-extension"
+  mkdir -p "$mock_bin" "$extension_root" "$external_target"
+  ln -s "$external_target" "$extension_root/rclone-mount-manager@jelovac.net"
+
+  cat >"$mock_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  cat >"$mock_bin/gnome-extensions" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$mock_bin/systemctl" "$mock_bin/gnome-extensions"
+
+  HOME="$home_dir" PATH="$mock_bin:/usr/bin:/bin" "$PROJECT_DIR/install.sh" --user --force --no-alias --gnome-extension >/dev/null
+  [[ -L "$extension_root/rclone-mount-manager@jelovac.net" ]] || fail "extension directory symlink was replaced"
+  [[ -f "$external_target/extension.js" ]] || fail "extension was not installed through the directory symlink"
 
   rm -rf "$temp_dir"
 }
@@ -547,11 +715,18 @@ EOF
 
 main() {
   test_help
+  test_gnome_indicator_registers_gobject_type
+  test_doctor_waits_for_confirmation
   test_print_config_with_temp_config
   test_status_with_mock_mountpoint
   test_json_status_and_mount_control_requests
   test_install_dry_run
   test_install_force_keeps_config_unless_explicitly_replaced
+  test_user_install_rejects_sudo
+  test_unwritable_extension_stops_before_installation_non_interactively
+  test_privileged_extension_copy_is_scoped_and_user_owned
+  test_privileged_extension_copy_is_visible_in_dry_run
+  test_extension_target_directory_symlink_is_supported
   test_uninstall_dry_run
   test_uninstall_removes_owned_alias_only
   test_uninstall_keeps_unowned_alias

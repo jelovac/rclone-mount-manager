@@ -1,5 +1,7 @@
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -22,7 +24,7 @@ async function runCapture(argv, cancellable = null) {
         argv,
         Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
     );
-    const [, stdout, stderr] = await process.communicate_utf8_async(null, cancellable);
+    const [stdout, stderr] = await process.communicate_utf8_async(null, cancellable);
 
     return {
         ok: process.get_successful(),
@@ -95,16 +97,27 @@ function mountAppearance(mount) {
     return ['dialog-error-symbolic', 'rmm-mount-error'];
 }
 
+const RcloneIndicator = GObject.registerClass(
 class RcloneIndicator extends PanelMenu.Button {
     constructor(extension) {
         super(0.0, _('Rclone Mount Manager'));
 
         this._extension = extension;
+        this._box = new St.BoxLayout({
+            style_class: 'panel-status-menu-box',
+        });
         this._icon = new St.Icon({
             icon_name: 'folder-remote-symbolic',
             style_class: 'system-status-icon',
         });
-        this.add_child(this._icon);
+        this._label = new St.Label({
+            text: 'RMM',
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: 'rmm-indicator-label',
+        });
+        this._box.add_child(this._icon);
+        this._box.add_child(this._label);
+        this.add_child(this._box);
         this.visible = false;
         this._pendingMenuData = null;
         this.menu.connect('open-state-changed', (_menu, open) => {
@@ -305,7 +318,7 @@ class RcloneIndicator extends PanelMenu.Button {
         diagnostics.connect('activate', () => this._extension.openDiagnostics());
         this.menu.addMenuItem(diagnostics);
     }
-}
+});
 
 export default class RcloneMountManagerExtension extends Extension {
     enable() {
@@ -457,7 +470,7 @@ export default class RcloneMountManagerExtension extends Extension {
     }
 
     openDiagnostics() {
-        this._openTerminal([this.binary, 'doctor']);
+        this._openTerminal([this.binary, 'doctor', '--wait']);
     }
 
     _openTerminal(command) {

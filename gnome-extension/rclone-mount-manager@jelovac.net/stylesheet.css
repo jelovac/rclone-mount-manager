@@ -1,3 +1,8 @@
+.rmm-indicator-label {
+  margin-left: 0.35em;
+  font-weight: 600;
+}
+
 .rmm-indicator-warning {
   color: #f6d32d;
 }
