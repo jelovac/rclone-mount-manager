@@ -78,8 +78,8 @@ DEFAULT_OPTIONS=(
   --vfs-cache-mode full
   --vfs-cache-max-size 10G
   --vfs-cache-max-age 12h
-  --dir-cache-time 72h
-  --poll-interval 30s
+  --dir-cache-time 5m
+  --poll-interval 1m
   --attr-timeout 1s
   --transfers 4
   --multi-thread-streams 4
@@ -97,6 +97,42 @@ MOUNT_OPTIONS=(
 `MOUNT_OPTIONS` is a simple string. It is intended for normal rclone option
 pairs. For complex shell quoting, prefer adding the option to `DEFAULT_OPTIONS`
 or keep the value simple.
+
+### Directory Cache Tuning
+
+The default `5m` directory-cache lifetime is deliberately backend-neutral.
+Changes made through a mount update its in-memory directory cache immediately.
+Changes made through a provider's website or another client are detected within
+`--poll-interval` only when that backend supports change notifications. On a
+backend without that support, directory listings are refreshed only when
+`--dir-cache-time` expires.
+
+For a backend with change notifications, a long cache lifetime avoids repeated
+remote listings while polling invalidates directories that change. For example,
+OneDrive supports this combination:
+
+```bash
+MOUNT_OPTIONS=(
+  [PersonalDrive]="--dir-cache-time 72h --poll-interval 1m"
+)
+```
+
+OneDrive mounts at the drive root can also warm the complete directory cache in
+the background at startup. Delta listing makes that recursive refresh much more
+efficient:
+
+```bash
+MOUNT_OPTIONS=(
+  [PersonalDrive]="--dir-cache-time 72h --poll-interval 1m --onedrive-delta --vfs-refresh"
+)
+```
+
+Recursive refresh still consumes API requests and memory proportional to the
+directory tree, so leave it off for very large mounts unless faster first access
+is worth that cost. Do not use a multi-day directory-cache lifetime on a backend
+without change notifications unless stale changes made outside the mount are
+acceptable. For such backends, keep a finite lifetime and disable ineffective
+polling explicitly, for example `--dir-cache-time 10m --poll-interval 0`.
 
 ## Connectivity Checks
 
